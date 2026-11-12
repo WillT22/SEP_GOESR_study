@@ -423,6 +423,65 @@ print("MODES OF AVG DIFF PROTON FLUX BY SATELLITE & SENSOR")
 print(f"{'-'*65}")
 print(df_modes.to_string(index=False))
 
+
+#%% Find the end time of each event
+import pandas as pd
+
+threshold = 1e-2
+col_name = 'End_Time_UTC'
+
+# Clean the column names by removing any hidden leading/trailing spaces
+sep_catalog.columns = sep_catalog.columns.str.strip()
+
+# 1. Insert the new column, explicitly setting the dtype to timezone-aware UTC
+if col_name not in sep_catalog.columns:
+    sep_catalog.insert(1, col_name, pd.Series(pd.NaT, index=sep_catalog.index, dtype='datetime64[ns, UTC]'))
+else:
+    sep_catalog[col_name] = pd.Series(pd.NaT, index=sep_catalog.index, dtype='datetime64[ns, UTC]')
+
+# 2. Iterate through the DataFrame rows
+for idx, row in sep_catalog.iterrows():
+    
+    event_start = pd.to_datetime(row['Begin_Time_UTC'])
+    if event_start.tzinfo is None:
+        event_start = event_start.tz_localize('UTC')
+        
+    # The event cannot end until at least 24 hours have passed
+    min_end_time = event_start + pd.Timedelta(hours=24)
+    
+    # SAFEGUARD 1: Cap the search window to prevent runaway events across massive data gaps
+    max_end_time = event_start + pd.Timedelta(days=30) 
+    
+    potential_end_times = []
+    
+    for satellite in goes_data.keys():
+        for sensor in goes_data[satellite].keys():
+            
+            if 'P4' in goes_data[satellite][sensor]:
+                df_p4 = goes_data[satellite][sensor]['P4']
+                
+                # SAFEGUARD 2: Was this satellite active when the event started?
+                # Check if it logged any data between the event start and the 24-hour mark
+                active_mask = (df_p4.index >= event_start) & (df_p4.index <= min_end_time)
+                
+                if not df_p4[active_mask].empty:
+                    
+                    # The satellite is confirmed active for this event. Find the end time.
+                    time_logic = (df_p4.index > min_end_time) & (df_p4.index <= max_end_time)
+                    flux_logic = df_p4['AvgDiffProtonFlux'] < threshold
+                    
+                    event_ended_df = df_p4[time_logic & flux_logic]
+                    
+                    if not event_ended_df.empty:
+                        first_dip_time = event_ended_df.index[0]
+                        potential_end_times.append(first_dip_time)
+    
+    if potential_end_times:
+        sep_catalog.loc[idx, col_name] = max(potential_end_times)
+
+print("Event end times calculated successfully.")
+
+
 #%% Plot the flux data for one energy channel as a function of time
 # --- Configuration ---
 sat_name = 'goes16'
