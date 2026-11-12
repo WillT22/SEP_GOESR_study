@@ -54,7 +54,7 @@ sep_catalog = sep_catalog.rename(columns={
 
 #%% Import a singular data file (diagnostics)
 # Load the NetCDF file into an xarray Dataset and convert to DataFrame
-file_path = "C:\\Users\\Will\\Box\\SEP_Box\\SGPS_data\\goes18\\sgps-l2-avg5m\\2023\\sci_sgps-l2-avg5m_g18_d20230329_v3-0-0.nc"
+file_path = "C:\\Users\\wzt0020\\Box\\SEP_Box\\SGPS_data\\goes18\\sgps-l2-avg5m\\2023\\sci_sgps-l2-avg5m_g18_d20230329_v3-0-0.nc"
 dataset = xr.open_dataset(file_path, engine="netcdf4")
 df = dataset.to_dataframe().reset_index()
 
@@ -100,7 +100,7 @@ print("Dictionary populated successfully.")
 
 #%% Import all GOES-18 data files and populate the dictionary
 # 1. Point to the base directory (Year removed)
-data_dir = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\goes18\sgps-l2-avg5m\2023")
+data_dir = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\goes18\sgps-l2-avg5m\2023")
 all_file_paths = sorted(list(data_dir.rglob("*.nc")))
 print(f"Found {len(all_file_paths)} total files. Grouping by year...")
 
@@ -194,59 +194,84 @@ for (sensor, channel), group_df in grouped:
 print("Dictionary populated successfully with all files.")
 
 #%% Print Unique Energy Values for Each Sensor
-def get_channel_changes(goes_dict, satellite, sensor):
+def get_satellite_energy_ledger(goes_dict, satellite, sensors=[0, 1]):
     """
-    Scans the nested dictionary for calibration changes and returns a dictionary 
-    where keys are channels (e.g., 'Ch1') and values are DataFrames of the changes.
+    Scans the nested dictionary for calibration changes across all sensors 
+    and channels, returning a single consolidated DataFrame.
     """
-    sensor_dict = goes_dict[satellite][sensor]
-    
     # Reordered to strictly follow: Low, High, Effective
     energy_cols = ['DiffProtonLowerEnergy', 'DiffProtonUpperEnergy', 'DiffProtonEffectiveEnergy']
     col_names = ['Lower', 'Upper', 'Effective']
     
-    channel_dict = {}
+    all_changes = []
     
-    for channel_key, df_channel in sensor_dict.items():
-        # 1. Isolate the 3 energy columns, drop empty rows, round strictly to 2 decimals
-        df_en = df_channel[energy_cols].dropna().round(2)
-        
-        if df_en.empty:
+    for sensor in sensors:
+        if sensor not in goes_dict[satellite]:
             continue
             
-        # Rename columns for the final clean output
-        df_en.columns = col_names
+        sensor_dict = goes_dict[satellite][sensor]
+        
+        for channel_key, df_channel in sensor_dict.items():
+            # 1. Isolate the 3 energy columns, drop empty rows, round strictly to 2 decimals
+            df_en = df_channel[energy_cols].dropna().round(2)
             
-        # 2. Strip duplicate overlapping timestamps caused by midnight NetCDF boundaries
-        df_en = df_en[~df_en.index.duplicated(keep='first')].sort_index()
+            if df_en.empty:
+                continue
+                
+            # Rename columns for the final clean output
+            df_en.columns = col_names
+                
+            # 2. Strip duplicate overlapping timestamps caused by midnight NetCDF boundaries
+            df_en = df_en[~df_en.index.duplicated(keep='first')].sort_index()
+            
+            # 3. Extract rows where AT LEAST ONE of the three columns changed
+            changes_mask = (df_en != df_en.shift(1)).any(axis=1)
+            df_changed = df_en[changes_mask].copy()
+            
+            # 4. Insert Sensor and Channel as the first two columns
+            df_changed.insert(0, 'Sensor', sensor)
+            df_changed.insert(1, 'Channel', f"Ch{channel_key}")
+            
+            all_changes.append(df_changed)
+            
+    if not all_changes:
+        return pd.DataFrame()
         
-        # 3. Extract rows where AT LEAST ONE of the three columns changed
-        changes_mask = (df_en != df_en.shift(1)).any(axis=1)
-        
-        # Save the isolated DataFrame directly to our dictionary
-        channel_dict[f"Ch{channel_key}"] = df_en[changes_mask]
-        
-    return channel_dict
+    # 5. Concatenate all DataFrames
+    df_final = pd.concat(all_changes)
+    
+    # 6. Extract the numeric channel value for strict numerical sorting
+    df_final['ChannelNum'] = df_final['Channel'].str.replace('Ch', '').astype(int)
+    
+    # Ensure the index has a name so we can reference it easily during the sort
+    idx_name = df_final.index.name if df_final.index.name else 'Timestamp'
+    df_final.index.name = idx_name
+    
+    # Reset the index to sort by Timestamp -> Sensor -> ChannelNum, then put the index back
+    df_final = df_final.reset_index()
+    df_final = df_final.sort_values(by=[idx_name, 'Sensor', 'ChannelNum'])
+    df_final = df_final.set_index(idx_name)
+    
+    # Drop the temporary sorting column
+    df_final = df_final.drop(columns=['ChannelNum'])
+    
+    return df_final
+
 
 # --- Apply the function and print formatted output ---
 sat_name = 'goes18'
-sensors = [0, 1]
 
 # Set Pandas display option to strictly format floats to 2 decimals visually
 pd.set_option('display.float_format', '{:.2f}'.format)
 
-for sensor in sensors:
-    # Call your function (assuming you named it get_channel_changes)
-    ledger_dict = get_channel_changes(goes_data, sat_name, sensor)
-    
-    # Sort the dictionary keys numerically so Ch10 comes after Ch9, not Ch1
-    sorted_channels = sorted(ledger_dict.keys(), key=lambda x: int(x.replace('Ch', '')))
-    
-    for ch_key in sorted_channels:
-        print(f"\n{'-'*60}")
-        print(f"Satellite: {sat_name.upper()} | Sensor: {sensor} | Channel: {ch_key}")
-        print(f"{'-'*60}")
-        print(ledger_dict[ch_key])
+# Generate the consolidated ledger
+df_ledger = get_satellite_energy_ledger(goes_data, sat_name, sensors=[0, 1])
+
+# Print the single consolidated header
+print(f"\n{'-'*60}")
+print(f"Satellite: {sat_name.upper()}")
+print(f"{'-'*60}")
+print(df_ledger)
 
 # Reset the float format back to default so it doesn't affect unrelated scripts
 pd.reset_option('display.float_format')
