@@ -24,176 +24,98 @@ plt.rcParams.update({
 # SGPS Paper https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2021SW002750
 # SEPEM Study Paper https://www.aanda.org/articles/aa/full_html/2024/11/aa50046-24/aa50046-24.html
 
-#%% Import SEP Catalog
-url = "https://www.ngdc.noaa.gov/stp/space-weather/interplanetary-data/solar-proton-events/SEP%20page%20code.html"
-sep_tables = pd.read_html(url)
-sep_catalog = sep_tables[0]
+# =============================================================================
+# GLOBAL CONFIGURATION
+# =============================================================================
 
-# Overwrite the original columns with the converted timezone-aware datetimes
-sep_catalog['Begin Time Yr M/D (UTC)'] = pd.to_datetime(
-    sep_catalog['Begin Time Yr M/D (UTC)'], 
-    format='%Y %m/%d %H%M', 
-    utc=True, 
-    errors='coerce'
-)
+# The strict ordered list of instrument channels
+SGPS_CHANNELS = ['P1', 'P2A', 'P2B', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8A', 'P8B', 'P8C', 'P9', 'P10']
+# Generate reverse mapping automatically for strict sorting in other scripts: {'P1': 0, 'P2A': 1...}
+CHANNEL_TO_NUM = {ch: i for i, ch in enumerate(SGPS_CHANNELS)}
 
-# Note that 1979 07/07/1010 is a typo in the NOAA catalog that will become NaT after conversion.
-sep_catalog['Maximum Time Yr M/D (UTC)'] = pd.to_datetime(
-    sep_catalog['Maximum Time Yr M/D (UTC)'], 
-    format='%Y %m/%d %H%M', 
-    utc=True, 
-    errors='coerce'
-)
+# Define the base directory containing the satellite folders
+BASE_DATA_DIR = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
 
-# Rename the headers to your preferred uniform format
-sep_catalog = sep_catalog.rename(columns={
-    'Begin Time Yr M/D (UTC)': 'Begin_Time_UTC',
-    'Maximum Time Yr M/D (UTC)': 'Maximum_Time_UTC'
-})
+# --- DIAGNOSTIC MODE SETTINGS ---
+# Set to a specific string to isolate the run, or set to None to process all
+DIAGNOSTIC_SATELLITE = None  # e.g., 'goes19' or None
+DIAGNOSTIC_YEAR = None        # e.g., '2026' or None
 
+SATELLITES = [DIAGNOSTIC_SATELLITE] if DIAGNOSTIC_SATELLITE else ['goes16', 'goes17', 'goes18', 'goes19']
 
-#%% Import a singular data file (diagnostics)
-# Load the NetCDF file into an xarray Dataset and convert to DataFrame
-file_path = "C:\\Users\\wzt0020\\Box\\SEP_Box\\SGPS_data\\goes18\\sgps-l2-avg5m\\2023\\sci_sgps-l2-avg5m_g18_d20230329_v3-0-0.nc"
-dataset = xr.open_dataset(file_path, engine="netcdf4")
-df = dataset.to_dataframe().reset_index()
+# Initialize the master data structures
+goes_data = defaultdict(lambda: defaultdict(dict))
+yaw_ledgers = {}  # Will store ledgers only for GOES-17 and GOES-19
 
-# 1. Format the timestamp before splitting the data
-df['time'] = pd.to_datetime(df['time'], utc=True)
-
-# 2. Initialize the nested dictionary structure
-goes_data = {
-    'goes18': {
-        0: {},  # Sensor 0
-        1: {}   # Sensor 1
-    }
-}
-
-# 3. Define exactly which physics columns you want in the final DataFrames
-data_columns = [
-    'DiffProtonLowerEnergy', 
-    'DiffProtonUpperEnergy', 
-    'DiffProtonEffectiveEnergy', 
-    'AvgDiffProtonFlux', 
-    'AvgDiffProtonFluxUncert'
-]
-
-# 4. Group the flat dataframe by sensor and channel
-grouped = df.groupby(['sensor_units', 'diff_channels'])
-
-# 5. Loop through the groups and populate the dictionary
-for (sensor, channel), group_df in grouped:
-    # Cast to standard integers for clean dictionary keys
-    s_key = int(sensor)
-    c_key = int(channel)
+#%% Generate Functions
+# =============================================================================
+# FUNCTIONS
+# =============================================================================
+def generate_yaw_ledger(df):
+    """
+    Extracts a chronological ledger of spacecraft yaw maneuvers by using 
+    the telemetry yaw_flip_flag (0 = Upright, 1 = Maneuvering, 2 = Inverted).
+    Data gaps > 45 minutes are treated as a '1' (Maneuvering).
+    """
+    # 1. Isolate unique timestamps and the yaw flag, sort chronologically
+    df_time = df[['time', 'yaw_flip_flag']].drop_duplicates(subset=['time']).sort_values('time').reset_index(drop=True)
     
-    # Set the timestamp as the index
-    indexed_df = group_df.set_index('time')
+    ledger_data = []
     
-    # Keep only the requested data columns
-    final_df = indexed_df[data_columns]
+    # Trackers for the loop
+    in_maneuver = False
+    flip_start = None
     
-    # Assign the dataframe to its specific location in the nested dictionary
-    goes_data['goes18'][s_key][c_key] = final_df
-
-print("Dictionary populated successfully.")
-
-#%% Import all GOES-18 data files and populate the dictionary
-# 1. Point to the base directory (Year removed)
-data_dir = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\goes18\sgps-l2-avg5m\2023")
-all_file_paths = sorted(list(data_dir.rglob("*.nc")))
-print(f"Found {len(all_file_paths)} total files. Grouping by year...")
-
-# Group files by year by parsing the GOES filename (e.g., sci_sgps-l2-avg5m_g18_d20220101_v1.nc)
-files_by_year = defaultdict(list)
-for file in all_file_paths:
-    # Extracts the 4-digit year right after the '_d' in the filename
-    year = file.name.split('_d')[1][:4]
-    files_by_year[year].append(file)
-
-# Initialize a list to hold the daily dataframes
-all_daily_dfs = []
-
-# Define exactly which columns we want to extract
-vars_to_keep_base = [
-    'sensor_units', 'diff_channels',
-    'DiffProtonLowerEnergy', 'DiffProtonUpperEnergy', 
-    'DiffProtonEffectiveEnergy', 'AvgDiffProtonFlux', 'AvgDiffProtonFluxUncert'
-]
-
-# 2. Loop through each year, and run a progress bar for the files in that year
-for year in sorted(files_by_year.keys()):
-    year_files = files_by_year[year]
-    print(f"\n--- Loading Data for Year: {year} ---")
+    # Find the initial stable state to prevent logging the start of the dataset as a flip
+    stable_states = df_time[df_time['yaw_flip_flag'].isin([0, 2])]
+    if stable_states.empty:
+        return pd.DataFrame()
     
-    # Wrap the file list in tqdm to generate the progress bar
-    for file in tqdm(year_files, desc=f"Processing {year}", unit="file"):
-        with xr.open_dataset(file, engine="netcdf4") as dataset:
-            
-            if 'L2_SciData_TimeStamp' in dataset.variables:
-                time_col = 'L2_SciData_TimeStamp'
-            else:
-                time_col = 'time'
+    last_stable_flag = stable_states.iloc[0]['yaw_flip_flag']
+    
+    # 2. Iterate through the timeline to detect state changes
+    for i in range(1, len(df_time)):
+        prev_time = df_time.loc[i-1, 'time']
+        curr_time = df_time.loc[i, 'time']
+        
+        curr_flag = df_time.loc[i, 'yaw_flip_flag']
+        
+        # Check for gaps > 45 minutes (which we treat as a maneuver / flag 1)
+        dt = curr_time - prev_time
+        is_gap = dt > pd.Timedelta(minutes=45)
+        
+        if not in_maneuver:
+            # A maneuver begins if we hit a 1, a gap, or a direct jump to a new stable state
+            if curr_flag == 1 or is_gap or (curr_flag in [0, 2] and curr_flag != last_stable_flag):
+                in_maneuver = True
+                flip_start = prev_time
+        
+        if in_maneuver:
+            # The maneuver concludes when the telemetry settles on a stable 0 or 2
+            if curr_flag in [0, 2]:
                 
-            vars_to_keep = vars_to_keep_base + [time_col]
-            
-            # Extract only the necessary variables to a dataframe
-            df_daily = dataset[vars_to_keep].to_dataframe().reset_index()
-            
-            if time_col == 'L2_SciData_TimeStamp' and 'L2_SciData_TimeStamp' in df_daily.columns:
-                df_daily = df_daily.rename(columns={'L2_SciData_TimeStamp': 'time'})
+                # Only record to the ledger if the state actually changed (ignores random telemetry drops)
+                if curr_flag != last_stable_flag:
+                    flip_end = curr_time
+                    duration = flip_end - flip_start
+                    config = 'Inverted (S0=East, S1=West)' if curr_flag == 2 else 'Upright (S0=West, S1=East)'
+                    
+                    ledger_data.append({
+                        'Flip Start (UTC)': flip_start,
+                        'Flip End (UTC)': flip_end,
+                        'Duration': duration,
+                        'New Configuration': config,
+                        'New State Flag': int(curr_flag)
+                    })
+                    
+                    # Update the stable tracker
+                    last_stable_flag = curr_flag
+                    
+                # Reset maneuver tracker
+                in_maneuver = False
                 
-            all_daily_dfs.append(df_daily)
+    return pd.DataFrame(ledger_data)
 
-# 3. Concatenate all daily dataframes into one massive dataframe
-print("\nConcatenating all files...")
-df_master = pd.concat(all_daily_dfs, ignore_index=True)
-
-# Format the timestamp and drop any empty rows generated by dimension alignment
-df_master = df_master.dropna(subset=['time'])
-df_master['time'] = pd.to_datetime(df_master['time'], utc=True)
-
-# Convert energies from keV to MeV
-energy_cols = ['DiffProtonLowerEnergy', 'DiffProtonUpperEnergy', 'DiffProtonEffectiveEnergy']
-df_master[energy_cols] = np.round(df_master[energy_cols] / 1000.0, decimals=2)
-
-# Convert differential fluxes from per keV to per MeV
-flux_cols = ['AvgDiffProtonFlux', 'AvgDiffProtonFluxUncert']
-df_master[flux_cols] = df_master[flux_cols] * 1000.0
-
-# 4. Initialize the nested dictionary structure
-goes_data = {
-    'goes18': {
-        0: {},  # Sensor 0
-        1: {}   # Sensor 1
-    }
-}
-
-data_columns = [
-    'DiffProtonLowerEnergy', 
-    'DiffProtonUpperEnergy', 
-    'DiffProtonEffectiveEnergy', 
-    'AvgDiffProtonFlux', 
-    'AvgDiffProtonFluxUncert'
-]
-
-# 5. Group the massive flat dataframe by sensor and channel
-print("Grouping data and populating dictionary...")
-grouped = df_master.groupby(['sensor_units', 'diff_channels'])
-
-# 6. Loop through the groups and populate the dictionary
-for (sensor, channel), group_df in grouped:
-    s_key = int(sensor)
-    c_key = int(channel)
-    
-    indexed_df = group_df.set_index('time').sort_index()
-    final_df = indexed_df[data_columns]
-    
-    goes_data['goes18'][s_key][c_key] = final_df
-
-print("Dictionary populated successfully with all files.")
-
-#%% Print Unique Energy Values for Each Sensor
 def get_satellite_energy_ledger(goes_dict, satellite, sensors=[0, 1]):
     """
     Scans the nested dictionary for calibration changes across all sensors 
@@ -230,7 +152,7 @@ def get_satellite_energy_ledger(goes_dict, satellite, sensors=[0, 1]):
             
             # 4. Insert Sensor and Channel as the first two columns
             df_changed.insert(0, 'Sensor', sensor)
-            df_changed.insert(1, 'Channel', f"Ch{channel_key}")
+            df_changed.insert(1, 'Channel', f"{channel_key}")
             
             all_changes.append(df_changed)
             
@@ -238,40 +160,212 @@ def get_satellite_energy_ledger(goes_dict, satellite, sensors=[0, 1]):
         return pd.DataFrame()
         
     # 5. Concatenate all DataFrames
-    df_final = pd.concat(all_changes)
+    df_energy_ledger = pd.concat(all_changes)
     
-    # 6. Extract the numeric channel value for strict numerical sorting
-    df_final['ChannelNum'] = df_final['Channel'].str.replace('Ch', '').astype(int)
+    # Define the exact sorting order for the new instrument channel names
+    channel_order = {
+        'P1': 0, 'P2A': 1, 'P2B': 2, 'P3': 3, 'P4': 4, 'P5': 5, 
+        'P6': 6, 'P7': 7, 'P8A': 8, 'P8B': 9, 'P8C': 10, 'P9': 11, 'P10': 12
+    }
+
+    # 6. Map the channel strings to their numerical rank for strict sorting
+    df_energy_ledger['ChannelNum'] = df_energy_ledger['Channel'].map(channel_order)
     
     # Ensure the index has a name so we can reference it easily during the sort
-    idx_name = df_final.index.name if df_final.index.name else 'Timestamp'
-    df_final.index.name = idx_name
+    idx_name = df_energy_ledger.index.name if df_energy_ledger.index.name else 'Timestamp'
+    df_energy_ledger.index.name = idx_name
     
     # Reset the index to sort by Timestamp -> Sensor -> ChannelNum, then put the index back
-    df_final = df_final.reset_index()
-    df_final = df_final.sort_values(by=[idx_name, 'Sensor', 'ChannelNum'])
-    df_final = df_final.set_index(idx_name)
+    df_energy_ledger = df_energy_ledger.reset_index()
+    df_energy_ledger = df_energy_ledger.sort_values(by=[idx_name, 'Sensor', 'ChannelNum'])
+    df_energy_ledger = df_energy_ledger.set_index(idx_name)
     
     # Drop the temporary sorting column
-    df_final = df_final.drop(columns=['ChannelNum'])
+    df_energy_ledger = df_energy_ledger.drop(columns=['ChannelNum'])
     
-    return df_final
+    return df_energy_ledger
+
+#%% Import SEP Catalog
+url = "https://www.ngdc.noaa.gov/stp/space-weather/interplanetary-data/solar-proton-events/SEP%20page%20code.html"
+sep_tables = pd.read_html(url)
+sep_catalog = sep_tables[0]
+
+# Overwrite the original columns with the converted timezone-aware datetimes
+sep_catalog['Begin Time Yr M/D (UTC)'] = pd.to_datetime(
+    sep_catalog['Begin Time Yr M/D (UTC)'], 
+    format='%Y %m/%d %H%M', 
+    utc=True, 
+    errors='coerce'
+)
+
+# Note that 1979 07/07/1010 is a typo in the NOAA catalog that will become NaT after conversion.
+sep_catalog['Maximum Time Yr M/D (UTC)'] = pd.to_datetime(
+    sep_catalog['Maximum Time Yr M/D (UTC)'], 
+    format='%Y %m/%d %H%M', 
+    utc=True, 
+    errors='coerce'
+)
+
+# Rename the headers to your preferred uniform format
+sep_catalog = sep_catalog.rename(columns={
+    'Begin Time Yr M/D (UTC)': 'Begin_Time_UTC',
+    'Maximum Time Yr M/D (UTC)': 'Maximum_Time_UTC'
+})
 
 
-# --- Apply the function and print formatted output ---
-sat_name = 'goes18'
+#%% Import all GOES data files and populate the dictionary
+# Note: Sensor 0 is -X (West) and Sensor 1 is +X (East). This is reversed when yaw_flip_flag is 2.
+# =============================================================================
+# DATA EXTRACTION & PROCESSING LOOP
+# =============================================================================
+vars_to_keep_base = [
+    'sensor_units', 'yaw_flip_flag', 'diff_channels',
+    'DiffProtonLowerEnergy', 'DiffProtonUpperEnergy', 
+    'DiffProtonEffectiveEnergy', 'AvgDiffProtonFlux', 'AvgDiffProtonFluxUncert'
+]
 
+data_columns = [
+    'DiffProtonLowerEnergy', 'DiffProtonUpperEnergy', 
+    'DiffProtonEffectiveEnergy', 'AvgDiffProtonFlux', 'AvgDiffProtonFluxUncert', 'yaw_flip_flag'
+]
+
+for sat_name in SATELLITES:
+    print(f"\n{'='*85}")
+    print(f"STARTING IMPORT FOR: {sat_name.upper()}")
+    print(f"{'='*85}")
+    
+    # Build dynamic path
+    sat_dir = BASE_DATA_DIR / sat_name / "sgps-l2-avg5m"
+    
+    if not sat_dir.exists():
+        print(f"Directory not found: {sat_dir}. Skipping {sat_name.upper()}...")
+        continue
+
+    all_file_paths = sorted(list(sat_dir.rglob("*.nc")))
+    print(f"Found {len(all_file_paths)} total files across all years.")
+
+    # Group files by year
+    files_by_year = defaultdict(list)
+    for file in all_file_paths:
+        try:
+            year = file.name.split('_d')[1][:4]
+            files_by_year[year].append(file)
+        except IndexError:
+            continue
+
+    all_daily_dfs = []
+
+    # Apply Diagnostic Year Filter
+    years_to_run = [DIAGNOSTIC_YEAR] if DIAGNOSTIC_YEAR else sorted(files_by_year.keys())
+
+    # 1. Load Data
+    for year in years_to_run:
+        if year not in files_by_year:
+            print(f"\n--- No data found for Year: {year} ---")
+            continue
+            
+        year_files = files_by_year[year]
+        print(f"\n--- Loading Data for Year: {year} ---")
+        
+        for file in tqdm(year_files, desc=f"Processing {year}", unit="file"):
+            with xr.open_dataset(file, engine="netcdf4") as dataset:
+                time_col = 'L2_SciData_TimeStamp' if 'L2_SciData_TimeStamp' in dataset.variables else 'time'
+                    
+                vars_in_file = [v for v in vars_to_keep_base if v in dataset.variables] + [time_col]
+                
+                df_daily = dataset[vars_in_file].to_dataframe().reset_index()
+                
+                if time_col == 'L2_SciData_TimeStamp' and 'L2_SciData_TimeStamp' in df_daily.columns:
+                    df_daily = df_daily.rename(columns={'L2_SciData_TimeStamp': 'time'})
+                    
+                all_daily_dfs.append(df_daily)
+
+    if not all_daily_dfs:
+        print(f"No valid data extracted for {sat_name.upper()}. Skipping...")
+        continue
+
+    # 2. Concatenate and Clean
+    print(f"\nConcatenating {sat_name.upper()} files...")
+    df_master = pd.concat(all_daily_dfs, ignore_index=True)
+    df_master = df_master.dropna(subset=['time'])
+    df_master['time'] = pd.to_datetime(df_master['time'], utc=True)
+
+    energy_cols = [c for c in ['DiffProtonLowerEnergy', 'DiffProtonUpperEnergy', 'DiffProtonEffectiveEnergy'] if c in df_master.columns]
+    df_master[energy_cols] = np.round(df_master[energy_cols] / 1000.0, decimals=2)
+
+    flux_cols = [c for c in ['AvgDiffProtonFlux', 'AvgDiffProtonFluxUncert'] if c in df_master.columns]
+    df_master[flux_cols] = df_master[flux_cols] * 1000.0
+
+    # 3. Group and Populate Main Dictionary
+    print(f"Grouping {sat_name.upper()} data and populating dictionary...")
+    grouped = df_master.groupby(['sensor_units', 'diff_channels'])
+
+    available_data_columns = [col for col in data_columns if col in df_master.columns]
+
+    for (sensor, channel), group_df in grouped:
+        s_key = int(sensor)
+        c_key = int(channel)
+        
+        try:
+            channel_name = SGPS_CHANNELS[c_key]
+        except IndexError:
+            channel_name = f"Unknown_{c_key}"
+        
+        indexed_df = group_df.set_index('time').sort_index()
+        goes_data[sat_name][s_key][channel_name] = indexed_df[available_data_columns]
+
+    print(f"{sat_name.upper()} dictionary populated successfully.")
+
+    # 4. Generate Yaw Ledger conditionally
+    if sat_name in ['goes17', 'goes19']:
+        print(f"\nGenerating Yaw Flip Ledger for {sat_name.upper()}...")
+        
+        df_yaw = generate_yaw_ledger(df_master)
+        yaw_ledgers[sat_name] = df_yaw
+        
+        print(f"\n{'-'*85}")
+        print(f"{sat_name.upper()} YAW FLIP LEDGER")
+        print(f"{'-'*85}")
+        if df_yaw.empty:
+            print("No yaw flips detected.")
+        else:
+            print(df_yaw.to_string(index=False))
+
+print(f"\n{'='*85}")
+print("ALL PROCESSING COMPLETE.")
+print(f"{'='*85}")
+
+#%% Print Unique Energy Values for Each Sensor
 # Set Pandas display option to strictly format floats to 2 decimals visually
 pd.set_option('display.float_format', '{:.2f}'.format)
 
-# Generate the consolidated ledger
-df_ledger = get_satellite_energy_ledger(goes_data, sat_name, sensors=[0, 1])
+# Define where you want to save the text file (saves in the current working directory by default)
+output_filepath = Path("satellite_energy_ledgers.txt")
 
-# Print the single consolidated header
-print(f"\n{'-'*60}")
-print(f"Satellite: {sat_name.upper()}")
-print(f"{'-'*60}")
-print(df_ledger)
+# Open the file in write mode ('w')
+with open(output_filepath, 'w') as f:
+    
+    # Loop through all satellites that were successfully loaded into the dictionary
+    for sat_name in goes_data.keys():
+        
+        # Generate the consolidated ledger
+        df_ledger = get_satellite_energy_ledger(goes_data, sat_name, sensors=[0, 1])
+        
+        # Construct the header string
+        header = f"\n{'-'*60}\nSatellite: {sat_name.upper()}\n{'-'*60}\n"
+        
+        # 1. Print to the console so you can still see it in your notebook/terminal
+        print(header)
+        print(df_ledger)
+        
+        # 2. Write the exact same output to the text file
+        f.write(header)
+        # .to_string() converts the dataframe to a clean text table honoring the float format
+        f.write(df_ledger.to_string() + "\n")
+
+print(f"\n[{'-'*40}]")
+print(f"Success! Output saved to: {output_filepath.absolute()}")
+print(f"[{'-'*40}]")
 
 # Reset the float format back to default so it doesn't affect unrelated scripts
 pd.reset_option('display.float_format')
@@ -279,13 +373,13 @@ pd.reset_option('display.float_format')
 
 #%% Plot the flux data for one energy channel as a function of time
 # --- Configuration ---
-sat_name = 'goes18'
-target_channel = 4
+sat_name = 'goes19'
+target_channel = 'P3'
 threshold = 1e-2  # Threshold for plotting horizontal line
 
 # Set to a date string (e.g., '2023-03-01') or leave as None or '' to plot all data
-start_date = '2023-07-17 20:00'  # '2023-04-21 20:00', '2023-03-13'
-end_date = '2023-07-22'  # '2023-04-24 16:00', '2023-03-24'   
+start_date = None # '2023-07-17 20:00'  # '2023-04-21 20:00', '2023-03-13'
+end_date = None # '2023-07-22'  # '2023-04-24 16:00', '2023-03-24'   
 
 # Averaging flag (Pandas offset strings: '5min' for raw, '1H' for hourly, '1D' for daily)
 averaging = '5min'  
@@ -297,8 +391,8 @@ s1_flux = goes_data[sat_name][1][target_channel]['AvgDiffProtonFlux']
 
 # Combine into a single DataFrame for easy plotting and drop zeros
 df_flux_plot = pd.DataFrame({
-    f'S0_Ch{target_channel}': s0_flux,
-    f'S1_Ch{target_channel}': s1_flux
+    f'S0_{target_channel}': s0_flux,
+    f'S1_{target_channel}': s1_flux
 }).replace(0, np.nan)
 
 # --- Date Filtering ---
@@ -337,13 +431,13 @@ plt.show()
 
 #%% Plot all channels for both sensors in a single figure for an event
 # --- Configuration ---
-sat_name = 'goes18'
-sensor = 1  # Sensor 0 or 1
+sat_name = 'goes19'
+sensor = 0  # Sensor 0 or 1
 threshold = 1e-2  # Threshold for plotting horizontal line
 
 # Set to a date string (e.g., '2023-03-01') or leave as None or '' to plot all data
-start_date = '2023-07-17 20:00'  
-end_date = '2023-07-22'          
+start_date = None # '2023-07-17 20:00'  
+end_date = None # '2023-07-22'          
 
 # Averaging flag (Pandas offset strings: '5min' for raw, '1H' for hourly, '1D' for daily)
 averaging = '5min'  
@@ -351,12 +445,12 @@ averaging = '5min'
 # --- Data Extraction ---
 flux_dict = {}
 
-# Loop over both sensors and all 12 channels
-for ch in range(1, 13):
+# Loop over the official channel names instead of integers
+for ch_name in goes_data[sat_name][sensor].keys():
     # Check if the channel exists in the dictionary to prevent KeyErrors
-    if ch in goes_data[sat_name][sensor]:
-        col_name = f'S{sensor}_Ch{ch}'
-        flux_dict[col_name] = goes_data[sat_name][sensor][ch]['AvgDiffProtonFlux']
+    if ch_name in goes_data[sat_name][sensor]:
+        col_name = f'S{sensor}_{ch_name}'
+        flux_dict[col_name] = goes_data[sat_name][sensor][ch_name]['AvgDiffProtonFlux']
 
 # Combine into a single DataFrame for easy plotting and drop zeros
 df_flux_plot = pd.DataFrame(flux_dict).replace(0, np.nan)
@@ -398,7 +492,8 @@ plt.show()
 
 #%% Plot the maximum flux for each channel as a function of the effective energy for a given sensor
 # --- Configuration ---
-sat_name = 'goes18'
+sat_name = 'goes19'
+FONT_SIZE = 12
 
 # Set to a date string (e.g., '2023-03-01') or leave as None to plot all data
 start_date = '2023-07-17 20:00'  
@@ -409,43 +504,41 @@ summary_data = []
 
 # Loop over both sensors
 for sensor in [0, 1]:
-    for ch in range(1, 14):
-        if ch in goes_data[sat_name][sensor]:
-            df_channel = goes_data[sat_name][sensor][ch]
+    for ch in goes_data[sat_name][sensor].keys():
+        df_channel = goes_data[sat_name][sensor][ch]
+        
+        # Isolate the flux data and apply date filters
+        flux_series = df_channel['AvgDiffProtonFlux'].replace(0, np.nan).dropna()
+        if start_date:
+            flux_series = flux_series.loc[start_date:]
+        if end_date:
+            flux_series = flux_series.loc[:end_date]
             
-            # Isolate the flux data and apply date filters
-            flux_series = df_channel['AvgDiffProtonFlux'].replace(0, np.nan).dropna()
-            if start_date:
-                flux_series = flux_series.loc[start_date:]
-            if end_date:
-                flux_series = flux_series.loc[:end_date]
+        if not flux_series.empty:
+            ch_max_time = flux_series.idxmax()
+            ch_max_flux = flux_series.max()
+            
+            # Check if the maximum flux meets the threshold before saving
+            if ch_max_flux > 1e-3:
                 
-            if not flux_series.empty:
-                ch_max_time = flux_series.idxmax()
-                ch_max_flux = flux_series.max()
-                
-                # Check if the maximum flux meets the threshold before saving
-                if ch_max_flux > 1e-3:
+                # Extract corresponding effective energy
+                if ch_max_time in df_channel.index:
+                    eff_energy = df_channel.loc[ch_max_time, 'DiffProtonEffectiveEnergy']
                     
-                    # Extract corresponding effective energy
-                    if ch_max_time in df_channel.index:
-                        eff_energy = df_channel.loc[ch_max_time, 'DiffProtonEffectiveEnergy']
-                        
-                        summary_data.append({
-                            'Sensor': sensor,
-                            'ChannelNum': ch,  # Used to lock the colormap sequence
-                            'Channel': f'Ch{ch}',
-                            'EffectiveEnergy': eff_energy,
-                            'MaxFlux': ch_max_flux,
-                            'MaxTime': ch_max_time  
-                        })
+                    summary_data.append({
+                        'Sensor': sensor,  # Kept as integer so the plot loop filtering works
+                        'ChannelNum': CHANNEL_TO_NUM.get(ch, 0),  # Map the string (e.g., 'P1') back to an integer for the colormap
+                        'Channel': ch,  # Store the string name for the plot labels
+                        'EffectiveEnergy': eff_energy,
+                        'MaxFlux': ch_max_flux,
+                        'MaxTime': ch_max_time  
+                    })
 
 df_summary = pd.DataFrame(summary_data).dropna()
 
-# --- Generate the Plot ---
 fig, ax = plt.subplots(figsize=(14, 6))
 
-markers = {0: 'o', 1: '^'}  # Circles for Sensor 0, Triangles for Sensor 1
+markers = {0: 'o', 1: '^'}  
 
 # 1. Plot the scatter points
 for sensor_id in [0, 1]:
@@ -458,7 +551,7 @@ for sensor_id in [0, 1]:
         df_sens['MaxFlux'], 
         c=df_sens['ChannelNum'],  
         cmap='turbo',
-        vmin=1, vmax=13,  
+        vmin=0, vmax=12,  # Adjusted to match the 0-12 mapping of the new channel list
         s=150,
         marker=markers[sensor_id],
         edgecolor='black', 
@@ -470,35 +563,33 @@ for sensor_id in [0, 1]:
 
 # 2. Add a single label per channel (placed above the highest point for that channel)
 for ch_num, group in df_summary.groupby('ChannelNum'):
-    # Average the X position slightly if the energies differ marginally
     label_x = group['EffectiveEnergy'].mean()
-    # Find the maximum Y position between Sensor 0 and Sensor 1 so the text clears both
     label_y = group['MaxFlux'].max()
     ch_name = group['Channel'].iloc[0]
     
     ax.annotate(
         ch_name, 
         (label_x, label_y),
-        xytext=(0, 12),             # Shift text 12 points straight up
+        xytext=(0, 12),             
         textcoords='offset points',
-        fontsize=FONT_SIZE - 2,
-        ha='center',                # Center align the text over the point
+        ha='center',                
         va='bottom',
         weight='bold'
     )
 
-# Formatting Dates dynamically for Title
 t_start = start_date if start_date else "Dataset Start"
 t_end = end_date if end_date else "Dataset End"
 
-fig.suptitle(f'{sat_name.upper()} Peak Flux Spectrum (Sensors 0 & 1) | {t_start} to {t_end}', fontsize=FONT_SIZE + 2, weight='bold')
+fig.suptitle(f'{sat_name.upper()} Peak Flux Spectrum (Sensors 0 & 1) | {t_start} to {t_end}')
 
 ax.set_xlabel('Effective Energy (MeV)')
 ax.set_ylabel('Maximum Flux (#/cm²/s/sr/MeV)')
 
 ax.yaxis.set_major_locator(ticker.LogLocator(base=10.0, numticks=20))
 ax.yaxis.set_major_formatter(ticker.LogFormatterMathtext())
-ax.set_ylim(bottom=1e-3, top=df_summary['MaxFlux'].max() * 2)
+
+if not df_summary.empty:
+    ax.set_ylim(bottom=1e-3, top=df_summary['MaxFlux'].max() * 2)
 
 ax.set_xscale('log')
 ax.set_yscale('log')
@@ -513,20 +604,18 @@ plt.show()
 
 # --- Generate the Time vs. Energy Plot ---
 fig, ax = plt.subplots(figsize=(14, 6))
-markers = {0: 'o', 1: '^'} 
 
 for sensor_id in [0, 1]:
     df_sens = df_summary[df_summary['Sensor'] == sensor_id]
     if df_sens.empty:
         continue
         
-    # Plot Peak Time on X and Effective Energy on Y
     ax.scatter(
         df_sens['MaxTime'], 
         df_sens['EffectiveEnergy'], 
         c=df_sens['ChannelNum'],  
         cmap='turbo',
-        vmin=1, vmax=13,  
+        vmin=0, vmax=12,  # Adjusted to match the 0-12 mapping
         s=150,
         marker=markers[sensor_id],
         edgecolor='black', 
@@ -538,7 +627,6 @@ for sensor_id in [0, 1]:
 
 # Annotate each point with its channel name
 for idx, row in df_summary.iterrows():
-    # Adding a slight vertical offset for S1 to prevent text overlap if times are identical
     y_offset = -12 if row['Sensor'] == 1 else 10 
     
     ax.annotate(
@@ -546,7 +634,6 @@ for idx, row in df_summary.iterrows():
         (row['MaxTime'], row['EffectiveEnergy']),
         xytext=(0, y_offset), 
         textcoords='offset points',
-        fontsize=FONT_SIZE - 2,
         ha='center',
         weight='bold'
     )
@@ -556,34 +643,28 @@ fig.suptitle(f'{sat_name.upper()} Time of Peak Flux vs. Effective Energy (Sensor
 ax.set_xlabel('Peak Time (UTC)')
 ax.set_ylabel('Effective Energy (MeV)')
 
-# Set Y-axis to logarithmic to properly space the energy bands
 ax.set_yscale('log')
 
 # --- Custom Stateful Date Formatting Logic ---
 class SparseDateFormatter(ticker.Formatter):
     def __call__(self, x, pos=None):
-        # Matplotlib sometimes calls this without a position during setup
         if pos is None or len(self.locs) == 0:
             return ''
             
         dt = mdates.num2date(x)
         
-        # Always populate the very first tick
         if pos == 0:
             year_str = dt.strftime('%Y')
             date_str = dt.strftime('%m/%d')
         else:
-            # Look at the previous tick to see if the year or day changed
             prev_dt = mdates.num2date(self.locs[pos - 1])
             year_str = dt.strftime('%Y') if dt.year != prev_dt.year else ' '
             date_str = dt.strftime('%m/%d') if dt.date() != prev_dt.date() else ' '
             
         time_str = dt.strftime('%H:%M')
         
-        # Return a 3-line string, preserving vertical spacing with spaces
         return f"{time_str}\n{date_str}\n{year_str}"
 
-# Apply the custom formatter
 ax.xaxis.set_major_formatter(SparseDateFormatter())
 plt.xticks(rotation=0, ha='center')
 
