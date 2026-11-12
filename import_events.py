@@ -6,6 +6,8 @@ from pathlib import Path
 from tqdm import tqdm
 from collections import defaultdict
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker
+import matplotlib.dates as mdates
 
 FONT_SIZE = 20
 plt.rcParams.update({
@@ -302,41 +304,268 @@ ax.set_title(f'{sat_name.upper()} Proton Flux Data (S0 & S1 Channel {target_chan
 ax.set_xlabel('Time (UTC)')
 ax.set_ylabel('Flux (#/cm²/s/sr/MeV)')
 
-# Calculate overall statistics based ONLY on the filtered/resampled data
-overall_mean = df_flux_plot.stack().mean()
-overall_mode = df_flux_plot.stack().mode()[0] if not df_flux_plot.stack().mode().empty else np.nan
-overall_max = df_flux_plot.max().max()
-
 # Plot statistic lines
 ax.axhline(threshold, linestyle='-.', color='b', label=f'Threshold: {threshold:.1e}')
-#ax.axhline(overall_mean, linestyle='--', color='k', label=f'Mean: {overall_mean:.2e}')
-#ax.axhline(overall_mode, linestyle='-.', color='b', label=f'Mode: {overall_mode:.2e}')
-#ax.axhline(overall_max, linestyle=':', color='r', label=f'Max: {overall_max:.2e}')
 
 ax.legend()
 plt.show()
 
-#%% Find the beginning flux for each SEP event in the catalog
+#%% Plot all channels for both sensors in a single figure for an event
 # --- Configuration ---
 sat_name = 'goes18'
-sensor = 0
+sensor = 1  # Sensor 0 or 1
+threshold = 1e-2  # Threshold for plotting horizontal line
 
-# 1. Combine all channels (1-13) into a single DataFrame for the target sensor
+# Set to a date string (e.g., '2023-03-01') or leave as None or '' to plot all data
+start_date = '2023-07-17 20:00'  
+end_date = '2023-07-22'          
+
+# Averaging flag (Pandas offset strings: '5min' for raw, '1H' for hourly, '1D' for daily)
+averaging = '5min'  
+
+# --- Data Extraction ---
 flux_dict = {}
-for ch in range(1, 14):
+
+# Loop over both sensors and all 12 channels
+for ch in range(1, 13):
+    # Check if the channel exists in the dictionary to prevent KeyErrors
     if ch in goes_data[sat_name][sensor]:
-        flux_dict[f'Ch{ch}'] = goes_data[sat_name][sensor][ch]['AvgDiffProtonFlux']
+        col_name = f'S{sensor}_Ch{ch}'
+        flux_dict[col_name] = goes_data[sat_name][sensor][ch]['AvgDiffProtonFlux']
 
-df_all_flux = pd.DataFrame(flux_dict).dropna(how='all')
+# Combine into a single DataFrame for easy plotting and drop zeros
+df_flux_plot = pd.DataFrame(flux_dict).replace(0, np.nan)
 
-# 2. Ensure the catalog times are formatted as UTC datetime objects to match GOES data
-catalog_times = pd.to_datetime(sep_catalog['Begin_Time_UTC'], utc=True)
+# --- Date Filtering ---
+if start_date:
+    df_flux_plot = df_flux_plot.loc[start_date:]
+if end_date:
+    df_flux_plot = df_flux_plot.loc[:end_date]
 
-# 3. Extract the flux at the exact (or closest) timestamps
-# Tolerance ensures it doesn't pull a value from days ago if there is a data gap
-event_flux_df = df_all_flux.reindex(catalog_times, method='nearest', tolerance=pd.Timedelta('5min'))
+# --- Time Resampling ---
+if averaging != '5min':
+    df_flux_plot = df_flux_plot.resample(averaging).mean()
 
-# for ch in range(1, 12):
-#     min_flux = event_flux_df[f'Ch{ch}'].dropna().values.min()
-#     max_flux = event_flux_df[f'Ch{ch}'].dropna().values.max()
-#     print(f"Channel {ch}: Min Flux = {min_flux:.2e}, Max Flux = {max_flux:.2e}")
+avg_label = {'5min': '5-Minute', '1H': 'Hourly', '1D': 'Daily'}.get(averaging, f'{averaging}')
+
+# --- Generate the Plot ---
+fig, ax = plt.subplots(figsize=(18, 7))
+
+# Plot all columns using a sequential rainbow colormap ('turbo' or 'rainbow')
+df_flux_plot.plot(ax=ax, linewidth=1.5, colormap='turbo')
+ax.set_yscale('log')
+
+# Dynamically update the title
+min_date = df_flux_plot.index.min().strftime('%Y-%m-%d')
+max_date = df_flux_plot.index.max().strftime('%Y-%m-%d')
+ax.set_title(f'{sat_name.upper()} Proton Flux Data (All Channels, Sensor {sensor}) | {avg_label} Average', pad=20)
+
+ax.set_xlabel('Time (UTC)')
+ax.set_ylabel('Flux (#/cm²/s/sr/MeV)')
+
+# Move the legend outside the plot area since it contains 27 items
+ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left', borderaxespad=0.)
+
+# Adjust layout so the legend isn't cut off when saving or viewing
+plt.tight_layout()
+plt.show()
+
+
+#%% Plot the maximum flux for each channel as a function of the effective energy for a given sensor
+# --- Configuration ---
+sat_name = 'goes18'
+
+# Set to a date string (e.g., '2023-03-01') or leave as None to plot all data
+start_date = '2023-07-17 20:00'  
+end_date = '2023-07-22'   
+
+# --- Data Extraction & Max Flux Calculation ---
+summary_data = []
+
+# Loop over both sensors
+for sensor in [0, 1]:
+    for ch in range(1, 14):
+        if ch in goes_data[sat_name][sensor]:
+            df_channel = goes_data[sat_name][sensor][ch]
+            
+            # Isolate the flux data and apply date filters
+            flux_series = df_channel['AvgDiffProtonFlux'].replace(0, np.nan).dropna()
+            if start_date:
+                flux_series = flux_series.loc[start_date:]
+            if end_date:
+                flux_series = flux_series.loc[:end_date]
+                
+            if not flux_series.empty:
+                ch_max_time = flux_series.idxmax()
+                ch_max_flux = flux_series.max()
+                
+                # Check if the maximum flux meets the threshold before saving
+                if ch_max_flux > 1e-3:
+                    
+                    # Extract corresponding effective energy
+                    if ch_max_time in df_channel.index:
+                        eff_energy = df_channel.loc[ch_max_time, 'DiffProtonEffectiveEnergy']
+                        
+                        summary_data.append({
+                            'Sensor': sensor,
+                            'ChannelNum': ch,  # Used to lock the colormap sequence
+                            'Channel': f'Ch{ch}',
+                            'EffectiveEnergy': eff_energy,
+                            'MaxFlux': ch_max_flux,
+                            'MaxTime': ch_max_time  
+                        })
+
+df_summary = pd.DataFrame(summary_data).dropna()
+
+# --- Generate the Plot ---
+fig, ax = plt.subplots(figsize=(14, 6))
+
+markers = {0: 'o', 1: '^'}  # Circles for Sensor 0, Triangles for Sensor 1
+
+# 1. Plot the scatter points
+for sensor_id in [0, 1]:
+    df_sens = df_summary[df_summary['Sensor'] == sensor_id]
+    if df_sens.empty:
+        continue
+        
+    ax.scatter(
+        df_sens['EffectiveEnergy'], 
+        df_sens['MaxFlux'], 
+        c=df_sens['ChannelNum'],  
+        cmap='turbo',
+        vmin=1, vmax=13,  
+        s=150,
+        marker=markers[sensor_id],
+        edgecolor='black', 
+        linewidth=1.5, 
+        alpha=0.9,
+        zorder=3,
+        label=f'Sensor {sensor_id}'
+    )
+
+# 2. Add a single label per channel (placed above the highest point for that channel)
+for ch_num, group in df_summary.groupby('ChannelNum'):
+    # Average the X position slightly if the energies differ marginally
+    label_x = group['EffectiveEnergy'].mean()
+    # Find the maximum Y position between Sensor 0 and Sensor 1 so the text clears both
+    label_y = group['MaxFlux'].max()
+    ch_name = group['Channel'].iloc[0]
+    
+    ax.annotate(
+        ch_name, 
+        (label_x, label_y),
+        xytext=(0, 12),             # Shift text 12 points straight up
+        textcoords='offset points',
+        fontsize=FONT_SIZE - 2,
+        ha='center',                # Center align the text over the point
+        va='bottom',
+        weight='bold'
+    )
+
+# Formatting Dates dynamically for Title
+t_start = start_date if start_date else "Dataset Start"
+t_end = end_date if end_date else "Dataset End"
+
+fig.suptitle(f'{sat_name.upper()} Peak Flux Spectrum (Sensors 0 & 1) | {t_start} to {t_end}', fontsize=FONT_SIZE + 2, weight='bold')
+
+ax.set_xlabel('Effective Energy (MeV)')
+ax.set_ylabel('Maximum Flux (#/cm²/s/sr/MeV)')
+
+ax.yaxis.set_major_locator(ticker.LogLocator(base=10.0, numticks=20))
+ax.yaxis.set_major_formatter(ticker.LogFormatterMathtext())
+ax.set_ylim(bottom=1e-3, top=df_summary['MaxFlux'].max() * 2)
+
+ax.set_xscale('log')
+ax.set_yscale('log')
+
+ax.legend(title='Instrument')
+
+ax.grid(True, which='major', linestyle='-', linewidth=0.7, alpha=0.7, zorder=0)
+ax.grid(True, which='minor', linestyle=':', linewidth=0.5, alpha=0.4, zorder=0)
+
+plt.tight_layout()
+plt.show()
+
+# --- Generate the Time vs. Energy Plot ---
+fig, ax = plt.subplots(figsize=(14, 6))
+markers = {0: 'o', 1: '^'} 
+
+for sensor_id in [0, 1]:
+    df_sens = df_summary[df_summary['Sensor'] == sensor_id]
+    if df_sens.empty:
+        continue
+        
+    # Plot Peak Time on X and Effective Energy on Y
+    ax.scatter(
+        df_sens['MaxTime'], 
+        df_sens['EffectiveEnergy'], 
+        c=df_sens['ChannelNum'],  
+        cmap='turbo',
+        vmin=1, vmax=13,  
+        s=150,
+        marker=markers[sensor_id],
+        edgecolor='black', 
+        linewidth=1.5, 
+        alpha=0.9,
+        zorder=3,
+        label=f'Sensor {sensor_id}'
+    )
+
+# Annotate each point with its channel name
+for idx, row in df_summary.iterrows():
+    # Adding a slight vertical offset for S1 to prevent text overlap if times are identical
+    y_offset = -12 if row['Sensor'] == 1 else 10 
+    
+    ax.annotate(
+        row['Channel'], 
+        (row['MaxTime'], row['EffectiveEnergy']),
+        xytext=(0, y_offset), 
+        textcoords='offset points',
+        fontsize=FONT_SIZE - 2,
+        ha='center',
+        weight='bold'
+    )
+
+fig.suptitle(f'{sat_name.upper()} Time of Peak Flux vs. Effective Energy (Sensors 0 & 1)', weight='bold', y=0.92)
+
+ax.set_xlabel('Peak Time (UTC)')
+ax.set_ylabel('Effective Energy (MeV)')
+
+# Set Y-axis to logarithmic to properly space the energy bands
+ax.set_yscale('log')
+
+# --- Custom Stateful Date Formatting Logic ---
+class SparseDateFormatter(ticker.Formatter):
+    def __call__(self, x, pos=None):
+        # Matplotlib sometimes calls this without a position during setup
+        if pos is None or len(self.locs) == 0:
+            return ''
+            
+        dt = mdates.num2date(x)
+        
+        # Always populate the very first tick
+        if pos == 0:
+            year_str = dt.strftime('%Y')
+            date_str = dt.strftime('%m/%d')
+        else:
+            # Look at the previous tick to see if the year or day changed
+            prev_dt = mdates.num2date(self.locs[pos - 1])
+            year_str = dt.strftime('%Y') if dt.year != prev_dt.year else ' '
+            date_str = dt.strftime('%m/%d') if dt.date() != prev_dt.date() else ' '
+            
+        time_str = dt.strftime('%H:%M')
+        
+        # Return a 3-line string, preserving vertical spacing with spaces
+        return f"{time_str}\n{date_str}\n{year_str}"
+
+# Apply the custom formatter
+ax.xaxis.set_major_formatter(SparseDateFormatter())
+plt.xticks(rotation=0, ha='center')
+
+ax.legend(title='Instrument')
+
+ax.grid(True, which='major', linestyle='-', linewidth=0.7, alpha=0.7, zorder=0)
+ax.grid(True, which='minor', linestyle=':', linewidth=0.5, alpha=0.4, zorder=0)
+
+plt.tight_layout()
+plt.show()
