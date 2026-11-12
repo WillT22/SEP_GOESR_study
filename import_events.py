@@ -371,15 +371,67 @@ print(f"[{'-'*40}]")
 pd.reset_option('display.float_format')
 
 
+#%% Find the mode of each satellite channel data
+from collections import defaultdict
+# Initialize the nested dictionary to store the modes dynamically
+sat_modes = defaultdict(lambda: defaultdict(dict))
+
+# Optional: Create a flat list to easily convert the results into a clean table later
+mode_records = []
+
+# Define which column you are finding the mode for
+target_col = 'AvgDiffProtonFlux'
+
+for sat_name, sensors in goes_data.items():
+    for sensor, channels in sensors.items():
+        for channel, df_channel in channels.items():
+            
+            # Ensure the column exists and the dataframe isn't empty to avoid errors
+            if target_col in df_channel.columns and not df_channel.empty:
+                
+                # Filter out zeros, NaNs, and negative fill/error values 
+                # (Physical flux cannot be negative, so > 0 isolates strict valid data)
+                valid_data = df_channel[df_channel[target_col] > 0.0][target_col].dropna()
+                
+                if not valid_data.empty:
+                    # .mode() returns a Series (in case of multi-modal ties), so extract the first value
+                    modes = valid_data.mode()
+                    
+                    if not modes.empty:
+                        mode_val = modes.iloc[0]
+                        
+                        # 1. Save to your nested dictionary
+                        sat_modes[sat_name][sensor][channel] = mode_val
+                        
+                        # 2. Append to the flat list for the tabular output
+                        mode_records.append({
+                            'Satellite': sat_name.upper(),
+                            'Sensor': sensor,
+                            'Channel': channel,
+                            'AvgDiffProtonFlux_Mode': mode_val
+                        })
+
+# Convert to a DataFrame for optimized viewing and exporting
+df_modes = pd.DataFrame(mode_records)
+
+# Sort strictly by Satellite, Sensor, and then the numeric channel order using your existing dictionary
+df_modes['Channel_Num'] = df_modes['Channel'].map(CHANNEL_TO_NUM)
+df_modes = df_modes.sort_values(['Satellite', 'Sensor', 'Channel_Num']).drop(columns=['Channel_Num'])
+
+print(f"\n{'-'*65}")
+print("MODES OF AVG DIFF PROTON FLUX BY SATELLITE & SENSOR")
+print(f"{'-'*65}")
+print(df_modes.to_string(index=False))
+
 #%% Plot the flux data for one energy channel as a function of time
 # --- Configuration ---
-sat_name = 'goes19'
-target_channel = 'P3'
-threshold = 1e-2  # Threshold for plotting horizontal line
+sat_name = 'goes16'
+target_channel = 'P9'
+threshold = 1e-3  # Threshold for plotting horizontal line
 
 # Set to a date string (e.g., '2023-03-01') or leave as None or '' to plot all data
-start_date = None # '2023-07-17 20:00'  # '2023-04-21 20:00', '2023-03-13'
-end_date = None # '2023-07-22'  # '2023-04-24 16:00', '2023-03-24'   
+start_date = None #'2025-05-31' # '2023-07-17 20:00'  # '2023-04-21 20:00', '2023-03-13'
+end_date =  None #'2025-06-10' # '2023-07-22'  # '2023-04-24 16:00', '2023-03-24'    
 
 # Averaging flag (Pandas offset strings: '5min' for raw, '1H' for hourly, '1D' for daily)
 averaging = '5min'  
@@ -496,8 +548,8 @@ sat_name = 'goes19'
 FONT_SIZE = 12
 
 # Set to a date string (e.g., '2023-03-01') or leave as None to plot all data
-start_date = '2023-07-17 20:00'  
-end_date = '2023-07-22'   
+start_date = '2025-05-31 17:00'  
+end_date = '2025-06-05'   
 
 # --- Data Extraction & Max Flux Calculation ---
 summary_data = []
