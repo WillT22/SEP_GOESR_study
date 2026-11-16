@@ -27,7 +27,7 @@ SGPS_CHANNELS = ['P1', 'P2A', 'P2B', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8A', 'P8B',
 CHANNEL_TO_NUM = {ch: i for i, ch in enumerate(SGPS_CHANNELS)}
 
 # Define the base directory containing the satellite folders
-BASE_DATA_DIR = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
+BASE_DATA_DIR = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data")
 
 SATELLITES = ['goes16', 'goes17', 'goes18', 'goes19']
 
@@ -36,15 +36,27 @@ data_columns = [
     'DiffProtonEffectiveEnergy', 'AvgDiffProtonFlux', 'AvgDiffProtonFluxUncert', 'yaw_flip_flag'
 ]
 
-# Load the Parquet file (this takes seconds and preserves datetimes perfectly)
-df_master = pd.read_parquet(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\goes_master_data.parquet")
-
-# Initialize dictionary and group
+# Initialize the nested dictionary
 goes_data = defaultdict(lambda: defaultdict(dict))
-grouped = df_master.groupby(['sensor_units', 'diff_channels'])
 
-available_data_columns = [col for col in data_columns if col in df_master.columns]
 for sat_name in SATELLITES:
+    print(f"{'-'*50}")
+    
+    # Define the path to this specific satellite's Parquet file
+    parquet_file = BASE_DATA_DIR / f"{sat_name}_master_data.parquet"
+    
+    if not parquet_file.exists():
+        print(f"No Parquet file found for {sat_name.upper()}. Skipping...")
+        continue
+        
+    print(f"Loading {sat_name.upper()}...")
+    df_sat = pd.read_parquet(parquet_file)
+    
+    available_data_columns = [col for col in data_columns if col in df_sat.columns]
+    
+    # Group the single satellite's data
+    grouped = df_sat.groupby(['sensor_units', 'diff_channels'])
+    
     for (sensor, channel), group_df in grouped:
         s_key = int(sensor)
         c_key = int(channel)
@@ -54,12 +66,181 @@ for sat_name in SATELLITES:
         except IndexError:
             channel_name = f"Unknown_{c_key}"
         
+        # Set time as index, sort chronologically, and subset columns
         indexed_df = group_df.set_index('time').sort_index()
         goes_data[sat_name][s_key][channel_name] = indexed_df[available_data_columns]
-
+        
     print(f"{sat_name.upper()} dictionary populated successfully.")
 
+print(f"\nAll available satellite data loaded into goes_data.")
+
+print(f"Dictionary successfully loaded. Available satellites: {list(goes_data.keys())}")
+
+#%% Plot all data for all channels
+def plot_goes_flux(goes_data, sat_name, sensor, start_date=None, end_date=None, averaging='5min', save_dir=None, show_plot=True):
+    """
+    Plots all channel proton fluxes for a specific GOES satellite and sensor.
+    
+    Parameters:
+    -----------
+    goes_data : dict
+        The nested master dictionary containing the satellite data.
+    sat_name : str
+        The satellite key (e.g., 'goes19').
+    sensor : int
+        The sensor number (e.g., 0 or 1).
+    start_date : str or None
+        Start date string (e.g., '2025-05-31 17:00').
+    end_date : str or None
+        End date string (e.g., '2025-06-05').
+    averaging : str
+        Pandas offset string ('5min', '1H', '1D').
+    save_dir : str
+        Directory to save figure. Disabled if 'None'.
+    show_plot : bool
+        Boolean of showing the plot in python.
+    """
+    
+    if sat_name not in goes_data or sensor not in goes_data[sat_name]:
+            print(f"Error: No data found for {sat_name.upper()} Sensor {sensor}.")
+            return
+
+    # --- 1. Extract Flux and Yaw Data ---
+    flux_dict = {}
+    
+    # Grab the first available channel to safely extract the yaw flag (since it's identical across channels)
+    first_ch = list(goes_data[sat_name][sensor].keys())[0]
+    has_yaw = 'yaw_flip_flag' in goes_data[sat_name][sensor][first_ch].columns
+    
+    if has_yaw:
+        df_yaw = goes_data[sat_name][sensor][first_ch][['yaw_flip_flag']].copy()
+
+    for ch_name in goes_data[sat_name][sensor].keys():
+        col_name = f'S{sensor}_{ch_name}'
+        flux_dict[col_name] = goes_data[sat_name][sensor][ch_name]['AvgDiffProtonFlux']
+
+    df_flux_plot = pd.DataFrame(flux_dict).replace(0, np.nan)
+
+    # --- 2. Apply Date Filters ---
+    if start_date:
+        df_flux_plot = df_flux_plot.loc[start_date:]
+        if has_yaw: df_yaw = df_yaw.loc[start_date:]
+    if end_date:
+        df_flux_plot = df_flux_plot.loc[:end_date]
+        if has_yaw: df_yaw = df_yaw.loc[:end_date]
+        
+    if df_flux_plot.empty:
+        print(f"No data available for {sat_name.upper()} Sensor {sensor} in the specified date range.")
+        return
+
+    # --- 3. Time Resampling ---
+    if averaging != '5min':
+        df_flux_plot = df_flux_plot.resample(averaging).mean()
+        # Note: We do not resample df_yaw, as we want the exact 5-min timestamp of the physical flip
+
+    avg_label = {'5min': '5-Minute', '1H': 'Hourly', '1D': 'Daily'}.get(averaging, f'{averaging}')
+
+    # --- 4. Generate the Base Plot ---
+    fig, ax = plt.subplots(figsize=(18, 7))
+
+    df_flux_plot.plot(ax=ax, linewidth=1.5, colormap='turbo')
+    ax.set_yscale('log')
+
+    # --- 5. Add Yaw Flip Lines & Orientation Labels ---
+    if has_yaw and not df_yaw.empty:
+        # Drop missing data to cleanly find the state blocks
+        df_yaw_clean = df_yaw.dropna(subset=['yaw_flip_flag']).copy()
+        
+        if not df_yaw_clean.empty:
+            # Group into contiguous blocks of the same yaw flag
+            df_yaw_clean['block'] = (df_yaw_clean['yaw_flip_flag'] != df_yaw_clean['yaw_flip_flag'].shift(1)).cumsum()
+            
+            for block_id, group in df_yaw_clean.groupby('block'):
+                state = group['yaw_flip_flag'].iloc[0]
+                start_t = group.index[0]
+                
+                # Determine physical orientation
+                if state == 0:
+                    orientation = 'West' if sensor == 0 else 'East'
+                elif state == 2:
+                    orientation = 'East' if sensor == 0 else 'West'
+                elif state == 1:
+                    orientation = 'Maneuvering'
+                else:
+                    orientation = 'Unknown'
+                
+                # Draw vertical dashed line at the transition (skip if it's the exact start of the plot to avoid overlapping the y-axis)
+                if start_t > df_flux_plot.index.min():
+                    ax.axvline(start_t, color='black', linestyle='--', linewidth=1.5, alpha=0.8, zorder=3)
+                
+                # Add text label at the top of the plot for this time block
+                # get_xaxis_transform() means X is in Datetime, but Y is a percentage (0.98 = 98% height)
+                ax.text(start_t, 0.98, f" {orientation} ", 
+                        transform=ax.get_xaxis_transform(), 
+                        fontsize=11, fontweight='bold', color='black',
+                        verticalalignment='top', horizontalalignment='left',
+                        bbox=dict(facecolor='white', alpha=0.9, edgecolor='gray', boxstyle='round,pad=0.2'),
+                        zorder=4)
+    else:
+        # Static label fallback for satellites without yaw flip capabilities (e.g., GOES-16 is always upright)
+        orientation = 'West' if sensor == 0 else 'East'
+        ax.text(df_flux_plot.index.min(), 0.98, f" {orientation} ", 
+                transform=ax.get_xaxis_transform(), 
+                fontsize=11, fontweight='bold', color='black',
+                verticalalignment='top', horizontalalignment='left',
+                bbox=dict(facecolor='white', alpha=0.9, edgecolor='gray', boxstyle='round,pad=0.2'),
+                zorder=4)
+
+    # --- 6. Formatting & Legends ---
+    min_date = df_flux_plot.index.min().strftime('%Y-%m-%d')
+    max_date = df_flux_plot.index.max().strftime('%Y-%m-%d')
+    ax.set_title(f'{sat_name.upper()} Proton Flux Data (All Channels, Sensor {sensor}) | {avg_label} Average\n({min_date} to {max_date})', pad=20)
+
+    ax.set_xlabel('Time (UTC)')
+    ax.set_ylabel('Flux (#/cm²/s/sr/MeV)')
+
+    # Move the legend outside the plot area
+    ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left', borderaxespad=0.)
+
+    # Adjust layout so the legend isn't cut off when saving or viewing
+    ax.margins(x=0, y=0)
+    plt.tight_layout()
+
+    # Save the figure (optional)
+    if save_dir:
+        save_path = Path(save_dir)
+        save_path.mkdir(parents=True, exist_ok=True) # Creates the folder if it doesn't exist
+        
+        # Create a clean filename dynamically
+        safe_start = start_date.replace(':', '').replace(' ', '_') if start_date else min_date
+        filename = f"{sat_name}_sensor{sensor}_{averaging}_{safe_start}.png"
+        full_filepath = save_path / filename
+        
+        # Save at high resolution (dpi=300) with no cropped edges
+        fig.savefig(full_filepath, dpi=300, bbox_inches='tight')
+        print(f"Saved: {filename}")
+
+    # Show the plot (optional)
+    if show_plot:
+        plt.show()
+    else:
+        plt.close(fig) # Closes the figure in the background to free up RAM
+
+
+# Plot all satellite data for operaiton period
+for satellite in goes_data.keys():
+    for sensor in goes_data[satellite].keys():
+        plot_goes_flux(goes_data, satellite, sensor, save_dir=r'C:\Users\Will\Box\SEP_Box\SGPS_data\data_figures')
+
+
+
 #%% Import SEP Catalog
+# =======================================================
+#
+#         Event Selection / Catalog Processing
+#
+# =======================================================
+
 url = "https://www.ngdc.noaa.gov/stp/space-weather/interplanetary-data/solar-proton-events/SEP%20page%20code.html"
 sep_tables = pd.read_html(url)
 sep_catalog = sep_tables[0]
@@ -87,6 +268,7 @@ sep_catalog = sep_catalog.rename(columns={
 })
 
 #%% Find the end time of each event
+# Implement channel-based thresholed
 threshold = 1e-2
 col_name = 'End_Time_UTC'
 
@@ -142,7 +324,7 @@ for idx, row in sep_catalog.iterrows():
 print("Event end times calculated successfully.")
 
 # Define the output path (adjust the folder/filename as needed)
-output_file = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\updated_sep_catalog.csv")
+output_file = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\updated_sep_catalog.csv")
 # Export the DataFrame to a CSV file
 sep_catalog.to_csv(output_file, index=False)
 print(f"Updated SEP catalog saved successfully to: {output_file}")
@@ -261,11 +443,10 @@ plt.show()
 # --- Configuration ---
 sat_name = 'goes19'
 sensor = 0  # Sensor 0 or 1
-threshold = 1e-2  # Threshold for plotting horizontal line
 
 # Set to a date string (e.g., '2023-03-01') or leave as None or '' to plot all data
-start_date = '2025-05-31 17:00'  
-end_date = '2025-06-05'            
+start_date = None #'2025-05-31 17:00'  
+end_date = None #'2025-06-05'            
 
 # Averaging flag (Pandas offset strings: '5min' for raw, '1H' for hourly, '1D' for daily)
 averaging = '5min'  

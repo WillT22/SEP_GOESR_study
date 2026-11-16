@@ -5,6 +5,7 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from collections import defaultdict
+import pickle
 
 # SGPS Paper https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2021SW002750
 # SEPEM Study Paper https://www.aanda.org/articles/aa/full_html/2024/11/aa50046-24/aa50046-24.html
@@ -19,7 +20,7 @@ SGPS_CHANNELS = ['P1', 'P2A', 'P2B', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8A', 'P8B',
 CHANNEL_TO_NUM = {ch: i for i, ch in enumerate(SGPS_CHANNELS)}
 
 # Define the base directory containing the satellite folders
-BASE_DATA_DIR = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
+BASE_DATA_DIR = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data")
 
 # --- DIAGNOSTIC MODE SETTINGS ---
 # Set to a specific string to isolate the run, or set to None to process all
@@ -254,6 +255,11 @@ for sat_name in SATELLITES:
     flux_cols = [c for c in ['AvgDiffProtonFlux', 'AvgDiffProtonFluxUncert'] if c in df_master.columns]
     df_master[flux_cols] = df_master[flux_cols] * 1000.0
 
+    # This saves it inside the satellite's specific file
+    parquet_output_path = BASE_DATA_DIR  / f"{sat_name}_master_data.parquet"
+    print(f"Saving {sat_name.upper()} Parquet file to {parquet_output_path}...")
+    df_master.to_parquet(parquet_output_path)
+
     # 3. Group and Populate Main Dictionary
     print(f"Grouping {sat_name.upper()} data and populating dictionary...")
     grouped = df_master.groupby(['sensor_units', 'diff_channels'])
@@ -319,9 +325,27 @@ if yaw_ledgers:
                 
     print("Yaw ledger saved successfully.")
 
-# Save the cleaned, flat dataframe before the grouping loop
-df_master.to_parquet(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\goes_master_data.parquet")
-print("Data saved to Parquet.")
+
+#%% Save data
+# 1. Convert the lambda-based defaultdicts into standard nested dicts
+standard_goes_data = {
+    sat_name: {
+        sensor: {
+            channel: df for channel, df in channels.items()
+        } for sensor, channels in sensors.items()
+    } for sat_name, sensors in goes_data.items()
+}
+
+# 2. Save to a binary .pkl file
+output_path = BASE_DATA_DIR / "goes_data_dictionary.pkl"
+
+print("Saving dictionary to pickle file...")
+with open(output_path, "wb") as f:
+    # protocol=pickle.HIGHEST_PROTOCOL makes saving large DataFrames much faster
+    pickle.dump(standard_goes_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+print(f"Dictionary successfully saved to {output_path}")
+
 
 #%% Print Unique Energy Values for Each Sensor
 # Set Pandas display option to strictly format floats to 2 decimals visually
