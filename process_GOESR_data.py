@@ -77,7 +77,7 @@ print(f"\nAll available satellite data loaded into goes_data.")
 print(f"Dictionary successfully loaded. Available satellites: {list(goes_data.keys())}")
 
 #%% Plot all data for all channels
-def plot_goes_flux(goes_data, sat_name, sensor, start_date=None, end_date=None, averaging='5min', save_dir=None, show_plot=True):
+def plot_goes_flux(goes_data, sat_name, sensor, start_date=None, end_date=None, averaging='5min', save_dir=None, show_plot=True, clean_yaw=True):
     """
     Plots all channel proton fluxes for a specific GOES satellite and sensor.
     
@@ -99,16 +99,23 @@ def plot_goes_flux(goes_data, sat_name, sensor, start_date=None, end_date=None, 
         Directory to save figure. Disabled if 'None'.
     show_plot : bool
         Boolean of showing the plot in python.
+    clean_yaw : bool
+        If True, despikes yaw telemetry, fills gaps, and cleanly staggers labels. 
+        If False, plots raw telemetry gaps, spikes, and Maneuvering/Unknown states.
     """
     
     if sat_name not in goes_data or sensor not in goes_data[sat_name]:
-            print(f"Error: No data found for {sat_name.upper()} Sensor {sensor}.")
-            return
+        print(f"Error: No data found for {sat_name.upper()} Sensor {sensor}.")
+        return
+
+    # Catch completely empty sensors
+    if not goes_data[sat_name][sensor]:
+        print(f"No channels populated for {sat_name.upper()} Sensor {sensor}. Skipping...")
+        return
 
     # --- 1. Extract Flux and Yaw Data ---
     flux_dict = {}
     
-    # Grab the first available channel to safely extract the yaw flag (since it's identical across channels)
     first_ch = list(goes_data[sat_name][sensor].keys())[0]
     has_yaw = 'yaw_flip_flag' in goes_data[sat_name][sensor][first_ch].columns
     
@@ -120,6 +127,24 @@ def plot_goes_flux(goes_data, sat_name, sensor, start_date=None, end_date=None, 
         flux_dict[col_name] = goes_data[sat_name][sensor][ch_name]['AvgDiffProtonFlux']
 
     df_flux_plot = pd.DataFrame(flux_dict).replace(0, np.nan)
+
+    # --- Filter out massive multi-month data gaps (Pre-operational testing anomalies) ---
+    if not df_flux_plot.empty and len(df_flux_plot) > 2:
+        time_diffs = df_flux_plot.index.to_series().diff()
+        max_gap = time_diffs.max()
+        
+        if pd.notna(max_gap) and max_gap > pd.Timedelta(days=90):
+            gap_idx = time_diffs.argmax()
+            points_before = gap_idx
+            points_after = len(df_flux_plot) - gap_idx
+            
+            if points_before < points_after:
+                df_flux_plot = df_flux_plot.iloc[gap_idx:]
+            else:
+                df_flux_plot = df_flux_plot.iloc[:gap_idx]
+                
+            if has_yaw and not df_yaw.empty:
+                df_yaw = df_yaw.loc[df_flux_plot.index.min() : df_flux_plot.index.max()]
 
     # --- 2. Apply Date Filters ---
     if start_date:
@@ -136,7 +161,6 @@ def plot_goes_flux(goes_data, sat_name, sensor, start_date=None, end_date=None, 
     # --- 3. Time Resampling ---
     if averaging != '5min':
         df_flux_plot = df_flux_plot.resample(averaging).mean()
-        # Note: We do not resample df_yaw, as we want the exact 5-min timestamp of the physical flip
 
     avg_label = {'5min': '5-Minute', '1H': 'Hourly', '1D': 'Daily'}.get(averaging, f'{averaging}')
 
@@ -148,48 +172,68 @@ def plot_goes_flux(goes_data, sat_name, sensor, start_date=None, end_date=None, 
 
     # --- 5. Add Yaw Flip Lines & Orientation Labels ---
     if has_yaw and not df_yaw.empty:
-        # Drop missing data to cleanly find the state blocks
-        df_yaw_clean = df_yaw.dropna(subset=['yaw_flip_flag']).copy()
+
+        # Apply cleanup logic ONLY if clean_yaw is True
+        if clean_yaw:
+            df_yaw['yaw_flip_flag'] = df_yaw['yaw_flip_flag'].ffill().bfill()
+            is_spike = (df_yaw['yaw_flip_flag'] != df_yaw['yaw_flip_flag'].shift(1)) & \
+                       (df_yaw['yaw_flip_flag'] != df_yaw['yaw_flip_flag'].shift(-1))
+            df_yaw.loc[is_spike, 'yaw_flip_flag'] = np.nan
+            df_yaw['yaw_flip_flag'] = df_yaw['yaw_flip_flag'].ffill().bfill()
+        else:
+            df_yaw['yaw_flip_flag'] = df_yaw['yaw_flip_flag'].fillna(1)
         
-        if not df_yaw_clean.empty:
-            # Group into contiguous blocks of the same yaw flag
-            df_yaw_clean['block'] = (df_yaw_clean['yaw_flip_flag'] != df_yaw_clean['yaw_flip_flag'].shift(1)).cumsum()
+        df_yaw['block'] = (df_yaw['yaw_flip_flag'] != df_yaw['yaw_flip_flag'].shift(1)).cumsum()
             
-            for block_id, group in df_yaw_clean.groupby('block'):
-                state = group['yaw_flip_flag'].iloc[0]
-                start_t = group.index[0]
-                
-                # Determine physical orientation
+        for block_id, group in df_yaw.groupby('block'):
+            state = group['yaw_flip_flag'].iloc[0]
+            start_t = group.index[0]
+            end_t = group.index[-1]
+
+            if clean_yaw:
+                # CLEAN VERSION: Centered text, ignore state 1
+                orientation = None 
                 if state == 0:
                     orientation = 'West' if sensor == 0 else 'East'
+                    y_pos = 0.98
                 elif state == 2:
                     orientation = 'East' if sensor == 0 else 'West'
-                elif state == 1:
-                    orientation = 'Maneuvering'
-                else:
-                    orientation = 'Unknown'
+                    y_pos = 0.98
                 
-                # Draw vertical dashed line at the transition (skip if it's the exact start of the plot to avoid overlapping the y-axis)
                 if start_t > df_flux_plot.index.min():
                     ax.axvline(start_t, color='black', linestyle='--', linewidth=1.5, alpha=0.8, zorder=3)
                 
-                # Add text label at the top of the plot for this time block
-                # get_xaxis_transform() means X is in Datetime, but Y is a percentage (0.98 = 98% height)
-                ax.text(start_t, 0.98, f" {orientation} ", 
-                        transform=ax.get_xaxis_transform(), 
-                        fontsize=11, fontweight='bold', color='black',
-                        verticalalignment='top', horizontalalignment='left',
-                        bbox=dict(facecolor='white', alpha=0.9, edgecolor='gray', boxstyle='round,pad=0.2'),
-                        zorder=4)
+                if orientation:
+                    ax.text(start_t, y_pos, f" {orientation} ", 
+                            transform=ax.get_xaxis_transform(), color='black',
+                            verticalalignment='top', horizontalalignment='left', zorder=4)
+            else:
+                # MESSY VERSION: Left-aligned text, show all states, raw heights
+                if state == 0:
+                    orientation = 'West' if sensor == 0 else 'East'
+                    y_pos = 0.98
+                elif state == 2:
+                    orientation = 'East' if sensor == 0 else 'West'
+                    y_pos = 0.98
+                elif state == 1:
+                    orientation = 'Maneuvering'
+                    y_pos = 0.88
+                else:
+                    orientation = 'Unknown'
+                    y_pos = 0.83
+                
+                if start_t > df_flux_plot.index.min():
+                    ax.axvline(start_t, color='black', linestyle='--', linewidth=1.5, alpha=0.8, zorder=3)
+                
+                ax.text(start_t, y_pos, f" {orientation} ", 
+                        transform=ax.get_xaxis_transform(), color='black',
+                        verticalalignment='top', horizontalalignment='left', zorder=4)
     else:
-        # Static label fallback for satellites without yaw flip capabilities (e.g., GOES-16 is always upright)
+        # Static label fallback
         orientation = 'West' if sensor == 0 else 'East'
-        ax.text(df_flux_plot.index.min(), 0.98, f" {orientation} ", 
-                transform=ax.get_xaxis_transform(), 
-                fontsize=11, fontweight='bold', color='black',
-                verticalalignment='top', horizontalalignment='left',
-                bbox=dict(facecolor='white', alpha=0.9, edgecolor='gray', boxstyle='round,pad=0.2'),
-                zorder=4)
+        ax.text(start_t, 0.98, f" {orientation} ", 
+                transform=ax.get_xaxis_transform(), color='black',
+                verticalalignment='top', zorder=4)
 
     # --- 6. Formatting & Legends ---
     min_date = df_flux_plot.index.min().strftime('%Y-%m-%d')
@@ -199,38 +243,35 @@ def plot_goes_flux(goes_data, sat_name, sensor, start_date=None, end_date=None, 
     ax.set_xlabel('Time (UTC)')
     ax.set_ylabel('Flux (#/cm²/s/sr/MeV)')
 
-    # Move the legend outside the plot area
     ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left', borderaxespad=0.)
-
-    # Adjust layout so the legend isn't cut off when saving or viewing
     ax.margins(x=0, y=0)
     plt.tight_layout()
 
-    # Save the figure (optional)
+    # --- 7. Save and Show ---
     if save_dir:
         save_path = Path(save_dir)
-        save_path.mkdir(parents=True, exist_ok=True) # Creates the folder if it doesn't exist
+        save_path.mkdir(parents=True, exist_ok=True)
         
-        # Create a clean filename dynamically
-        safe_start = start_date.replace(':', '').replace(' ', '_') if start_date else min_date
-        filename = f"{sat_name}_sensor{sensor}_{averaging}_{safe_start}.png"
+        # Append state suffix so they don't overwrite each other
+        state_suffix = "clean" if clean_yaw else "messy"
+        filename = f"{sat_name}_sensor{sensor}_{averaging}_{state_suffix}.png"
+        
         full_filepath = save_path / filename
-        
-        # Save at high resolution (dpi=300) with no cropped edges
         fig.savefig(full_filepath, dpi=300, bbox_inches='tight')
         print(f"Saved: {filename}")
 
-    # Show the plot (optional)
     if show_plot:
         plt.show()
     else:
-        plt.close(fig) # Closes the figure in the background to free up RAM
+        plt.close(fig)
 
 
 # Plot all satellite data for operaiton period
 for satellite in goes_data.keys():
     for sensor in goes_data[satellite].keys():
-        plot_goes_flux(goes_data, satellite, sensor, save_dir=r'C:\Users\Will\Box\SEP_Box\SGPS_data\data_figures')
+        plot_goes_flux(goes_data, satellite, sensor, 
+                       save_dir=r'C:\Users\Will\Box\SEP_Box\SGPS_data\data_figures',
+                       clean_yaw=True)
 
 
 
@@ -438,66 +479,6 @@ ax.axhline(threshold, linestyle='-.', color='b', label=f'Threshold: {threshold:.
 
 ax.legend()
 plt.show()
-
-#%% Plot all channels for both sensors in a single figure for an event
-# --- Configuration ---
-sat_name = 'goes19'
-sensor = 0  # Sensor 0 or 1
-
-# Set to a date string (e.g., '2023-03-01') or leave as None or '' to plot all data
-start_date = None #'2025-05-31 17:00'  
-end_date = None #'2025-06-05'            
-
-# Averaging flag (Pandas offset strings: '5min' for raw, '1H' for hourly, '1D' for daily)
-averaging = '5min'  
-
-# --- Data Extraction ---
-flux_dict = {}
-
-# Loop over the official channel names instead of integers
-for ch_name in goes_data[sat_name][sensor].keys():
-    # Check if the channel exists in the dictionary to prevent KeyErrors
-    if ch_name in goes_data[sat_name][sensor]:
-        col_name = f'S{sensor}_{ch_name}'
-        flux_dict[col_name] = goes_data[sat_name][sensor][ch_name]['AvgDiffProtonFlux']
-
-# Combine into a single DataFrame for easy plotting and drop zeros
-df_flux_plot = pd.DataFrame(flux_dict).replace(0, np.nan)
-
-# --- Date Filtering ---
-if start_date:
-    df_flux_plot = df_flux_plot.loc[start_date:]
-if end_date:
-    df_flux_plot = df_flux_plot.loc[:end_date]
-
-# --- Time Resampling ---
-if averaging != '5min':
-    df_flux_plot = df_flux_plot.resample(averaging).mean()
-
-avg_label = {'5min': '5-Minute', '1H': 'Hourly', '1D': 'Daily'}.get(averaging, f'{averaging}')
-
-# --- Generate the Plot ---
-fig, ax = plt.subplots(figsize=(18, 7))
-
-# Plot all columns using a sequential rainbow colormap ('turbo' or 'rainbow')
-df_flux_plot.plot(ax=ax, linewidth=1.5, colormap='turbo')
-ax.set_yscale('log')
-
-# Dynamically update the title
-min_date = df_flux_plot.index.min().strftime('%Y-%m-%d')
-max_date = df_flux_plot.index.max().strftime('%Y-%m-%d')
-ax.set_title(f'{sat_name.upper()} Proton Flux Data (All Channels, Sensor {sensor}) | {avg_label} Average', pad=20)
-
-ax.set_xlabel('Time (UTC)')
-ax.set_ylabel('Flux (#/cm²/s/sr/MeV)')
-
-# Move the legend outside the plot area since it contains 27 items
-ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left', borderaxespad=0.)
-
-# Adjust layout so the legend isn't cut off when saving or viewing
-plt.tight_layout()
-plt.show()
-
 
 #%% Plot the maximum flux for each channel as a function of the effective energy for a given sensor
 # --- Configuration ---

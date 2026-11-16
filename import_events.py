@@ -5,7 +5,6 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from collections import defaultdict
-import pickle
 
 # SGPS Paper https://agupubs.onlinelibrary.wiley.com/doi/10.1029/2021SW002750
 # SEPEM Study Paper https://www.aanda.org/articles/aa/full_html/2024/11/aa50046-24/aa50046-24.html
@@ -324,27 +323,6 @@ if yaw_ledgers:
                 f.write("\n\n")
                 
     print("Yaw ledger saved successfully.")
-
-
-#%% Save data
-# 1. Convert the lambda-based defaultdicts into standard nested dicts
-standard_goes_data = {
-    sat_name: {
-        sensor: {
-            channel: df for channel, df in channels.items()
-        } for sensor, channels in sensors.items()
-    } for sat_name, sensors in goes_data.items()
-}
-
-# 2. Save to a binary .pkl file
-output_path = BASE_DATA_DIR / "goes_data_dictionary.pkl"
-
-print("Saving dictionary to pickle file...")
-with open(output_path, "wb") as f:
-    # protocol=pickle.HIGHEST_PROTOCOL makes saving large DataFrames much faster
-    pickle.dump(standard_goes_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-print(f"Dictionary successfully saved to {output_path}")
 
 
 #%% Print Unique Energy Values for Each Sensor
