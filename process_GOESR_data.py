@@ -74,6 +74,24 @@ for sat_name in SATELLITES:
 
 print(f"\nAll available satellite data loaded into goes_data.")
 
+print("Applying historical yaw flip correction to goes_data...")
+
+for sat_name, sensors in goes_data.items():
+    for sensor, channels in sensors.items():
+        for channel, df_channel in channels.items():
+            
+            if 'yaw_flip_flag' in df_channel.columns and not df_channel.empty:
+                first_valid_idx = df_channel['yaw_flip_flag'].first_valid_index()
+                
+                if first_valid_idx is not None:
+                    # Fill everything before the first official recorded flag with 0 (Upright)
+                    df_channel.loc[:first_valid_idx, 'yaw_flip_flag'] = df_channel.loc[:first_valid_idx, 'yaw_flip_flag'].fillna(0)
+                else:
+                    # If there is no valid yaw data at all (e.g., historical GOES-16/17), assume 0 (Upright)
+                    df_channel['yaw_flip_flag'] = df_channel['yaw_flip_flag'].fillna(0)
+
+print("Historical yaw correction complete.")
+
 print(f"Dictionary successfully loaded. Available satellites: {list(goes_data.keys())}")
 
 #%% Plot all data for all channels
@@ -271,7 +289,7 @@ for satellite in goes_data.keys():
     for sensor in goes_data[satellite].keys():
         plot_goes_flux(goes_data, satellite, sensor, 
                        save_dir=r'C:\Users\wzt0020\Box\SEP_Box\SGPS_data\data_figures',
-                       clean_yaw=True)
+                       clean_yaw=False)
 
 
 #%% Import SEP Catalog
@@ -323,11 +341,14 @@ col_name = 'End_Time_UTC'
 # Clean the column names by removing any hidden leading/trailing spaces
 sep_catalog.columns = sep_catalog.columns.str.strip()
 
-# 1. Insert the new column, explicitly setting the dtype to timezone-aware UTC
+# 1. Insert the new P4 column into the main catalog for the CSV
 if col_name not in sep_catalog.columns:
     sep_catalog.insert(1, col_name, pd.Series(pd.NaT, index=sep_catalog.index, dtype='datetime64[ns, UTC]'))
 else:
     sep_catalog[col_name] = pd.Series(pd.NaT, index=sep_catalog.index, dtype='datetime64[ns, UTC]')
+
+# List to hold the comprehensive data for the Parquet file
+multi_channel_records = []
 
 # 2. Iterate through the DataFrame rows
 for idx, row in sep_catalog.iterrows():
@@ -337,308 +358,143 @@ for idx, row in sep_catalog.iterrows():
         event_start = event_start.tz_localize('UTC')
         
     # The event cannot end until at least 24 hours have passed
-    min_end_time = event_start + pd.Timedelta(hours=24)
-    
-    # SAFEGUARD 1: Cap the search window to prevent runaway events across massive data gaps
+    min_end_time = event_start + pd.Timedelta(hours=12)
+    # Cap the search window to prevent runaway events across massive data gaps
     max_end_time = event_start + pd.Timedelta(days=30) 
     
-    potential_end_times = []
+    # Initialize the record for this specific event to save to Parquet
+    event_record = {'Begin_Time_UTC': event_start}
     
-    for satellite in goes_data.keys():
-        for sensor in goes_data[satellite].keys():
+    # 3. Loop through EVERY energy channel
+    for ch in SGPS_CHANNELS:
+        ch_threshold = CHANNEL_THRESHOLDS.get(ch, 1e-3)
+        potential_end_times = []
+        
+        for satellite in goes_data.keys():
+            for sensor in goes_data[satellite].keys():
+                
+                if ch in goes_data[satellite][sensor]:
+                    df_ch = goes_data[satellite][sensor][ch]
+                    
+                    # Was this satellite active when the event started?
+                    active_mask = (df_ch.index >= event_start) & (df_ch.index <= min_end_time)
+                    
+                    if not df_ch[active_mask].empty:
+                        
+                        # The satellite is confirmed active. Find the end time using THIS channel's threshold.
+                        time_logic = (df_ch.index > min_end_time) & (df_ch.index <= max_end_time)
+                        flux_logic = df_ch['AvgDiffProtonFlux'] < ch_threshold
+                        
+                        event_ended_df = df_ch[time_logic & flux_logic]
+                        
+                        if not event_ended_df.empty:
+                            first_dip_time = event_ended_df.index[0]
+                            potential_end_times.append(first_dip_time)
+        
+        # 4. Resolve the end time for this specific channel
+        if potential_end_times:
+            final_ch_end_time = max(potential_end_times)
+        else:
+            final_ch_end_time = pd.NaT
             
-            if 'P4' in goes_data[satellite][sensor]:
-                df_p4 = goes_data[satellite][sensor]['P4']
-                
-                # SAFEGUARD 2: Was this satellite active when the event started?
-                # Check if it logged any data between the event start and the 24-hour mark
-                active_mask = (df_p4.index >= event_start) & (df_p4.index <= min_end_time)
-                
-                if not df_p4[active_mask].empty:
-                    
-                    # The satellite is confirmed active for this event. Find the end time.
-                    time_logic = (df_p4.index > min_end_time) & (df_p4.index <= max_end_time)
-                    flux_logic = df_p4['AvgDiffProtonFlux'] < thresholds
-                    
-                    event_ended_df = df_p4[time_logic & flux_logic]
-                    
-                    if not event_ended_df.empty:
-                        first_dip_time = event_ended_df.index[0]
-                        potential_end_times.append(first_dip_time)
-    
-    if potential_end_times:
-        sep_catalog.loc[idx, col_name] = max(potential_end_times)
+        # Add this channel's end time to the Parquet record dictionary
+        event_record[f'{ch}_End_Time'] = final_ch_end_time
+        
+        # If this is P4, explicitly save it back to the main sep_catalog for the CSV
+        if ch == 'P4':
+            sep_catalog.loc[idx, col_name] = final_ch_end_time
+
+    # Append the completed event record (with all 13 channel end times) to the master list
+    multi_channel_records.append(event_record)
 
 print("Event end times calculated successfully.")
 
-# Define the output path (adjust the folder/filename as needed)
-output_file = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\updated_sep_catalog.csv")
-# Export the DataFrame to a CSV file
-sep_catalog.to_csv(output_file, index=False)
-print(f"Updated SEP catalog saved successfully to: {output_file}")
+# =============================================================================
+# EXPORT DATA
+# =============================================================================
+base_out_dir = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
 
+# Export 1: The standard CSV with only the P4 end time
+csv_output_file = base_out_dir / "updated_sep_catalog.csv"
+sep_catalog.to_csv(csv_output_file, index=False)
+print(f"Updated SEP catalog (P4 End Time) saved to: {csv_output_file}")
 
-#%% Plot the flux data for one energy channel as a function of time
+# Export 2: The comprehensive Parquet file with all channel end times
+df_all_channels = pd.DataFrame(multi_channel_records)
+parquet_output_file = base_out_dir / "sep_catalog_all_channels.parquet"
+df_all_channels.to_parquet(parquet_output_file)
+print(f"Multi-channel end time catalog saved to: {parquet_output_file}")
+
+#%% Plot all events
 # --- Configuration ---
-sat_name = 'goes16'
-target_channel = 'P9'
-thresholds = 1e-3  # Threshold for plotting horizontal line
+# Set the base directory where you want the plot folders to go
+plot_output_base = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\Event_Plots")
+plot_output_base.mkdir(parents=True, exist_ok=True)
 
-# Set to a date string (e.g., '2023-03-01') or leave as None or '' to plot all data
-start_date = None #'2025-05-31' # '2023-07-17 20:00'  # '2023-04-21 20:00', '2023-03-13'
-end_date =  None #'2025-06-10' # '2023-07-22'  # '2023-04-24 16:00', '2023-03-24'    
+# Define a visual buffer so the plot doesn't start/end exactly on the event boundaries
+pre_event_buffer = pd.Timedelta(hours=12)
+post_event_buffer = pd.Timedelta(hours=24)
 
-# Averaging flag (Pandas offset strings: '5min' for raw, '1H' for hourly, '1D' for daily)
-averaging = '5min'  
+# Set the averaging for the event plots ('5min', '1H', etc.)
+plot_averaging = '5min'
 
-# --- Data Extraction ---
-# Extract the flux columns from the nested dictionary
-s0_flux = goes_data[sat_name][0][target_channel]['AvgDiffProtonFlux']
-s1_flux = goes_data[sat_name][1][target_channel]['AvgDiffProtonFlux']
+# --- Plotting Loop ---
+print(f"Starting batch plotting for {len(sep_catalog)} catalog entries...")
 
-# Combine into a single DataFrame for easy plotting and drop zeros
-df_flux_plot = pd.DataFrame({
-    f'S0_{target_channel}': s0_flux,
-    f'S1_{target_channel}': s1_flux
-}).replace(0, np.nan)
-
-# --- Date Filtering ---
-# Slice the dataframe if date variables are provided
-if start_date:
-    df_flux_plot = df_flux_plot.loc[start_date:]
-if end_date:
-    df_flux_plot = df_flux_plot.loc[:end_date]
-
-# --- Time Resampling ---
-# If anything other than 5min is selected, resample the data and take the mean
-if averaging != '5min':
-    df_flux_plot = df_flux_plot.resample(averaging).mean()
-
-# Create a clean label for the plot title
-avg_label = {'5min': '5-Minute', '1H': 'Hourly', '1D': 'Daily'}.get(averaging, f'{averaging}')
-
-# --- Generate the Plot ---
-fig, ax = plt.subplots(figsize=(18, 4))
-df_flux_plot.plot(ax=ax, linewidth=2)
-ax.set_yscale('log')
-
-# Dynamically update the title to show the date range and cadence being plotted
-min_date = df_flux_plot.index.min().strftime('%Y-%m-%d')
-max_date = df_flux_plot.index.max().strftime('%Y-%m-%d')
-ax.set_title(f'{sat_name.upper()} Proton Flux Data (S0 & S1 Channel {target_channel}) | {avg_label} Average | {min_date} to {max_date}')
-
-ax.set_xlabel('Time (UTC)')
-ax.set_ylabel('Flux (#/cm²/s/sr/MeV)')
-
-# Plot statistic lines
-ax.axhline(thresholds, linestyle='-.', color='b', label=f'Threshold: {thresholds:.1e}')
-
-ax.legend()
-plt.show()
-
-#%% Plot the maximum flux for each channel as a function of the effective energy for a given sensor
-# --- Configuration ---
-sat_name = 'goes18'
-
-# Set to a date string (e.g., '2023-03-01') or leave as None to plot all data
-start_date = '2025-05-31 17:00'  
-end_date = '2025-06-05'   
-
-# --- Data Extraction & Dual-Peak Calculation ---
-summary_data = []
-
-# Loop over both sensors
-for sensor in [0, 1]:
-    for ch in goes_data[sat_name][sensor].keys():
-        df_channel = goes_data[sat_name][sensor][ch]
-        
-        # Isolate the flux data and apply date filters
-        flux_series = df_channel['AvgDiffProtonFlux'].replace(0, np.nan).dropna()
-        if start_date:
-            flux_series = flux_series.loc[start_date:]
-        if end_date:
-            flux_series = flux_series.loc[:end_date]
-            
-        if not flux_series.empty:
-            
-            # 1. Calculate the Total Maximum Peak
-            total_max_time = flux_series.idxmax()
-            total_max_flux = flux_series.max()
-            
-            # Check if the maximum flux meets the thresholds before saving
-            if total_max_flux > 1e-3:
-                
-                # 2. Calculate the Onset (Prompt) Peak
-                # Prominence of 10% of the total max filters out minor statistical noise
-                peaks, _ = find_peaks(flux_series.values, prominence=total_max_flux * 0.10)
-                
-                if len(peaks) > 0:
-                    onset_idx = peaks[0]
-                    onset_time = flux_series.index[onset_idx]
-                    onset_flux = flux_series.iloc[onset_idx]
-                else:
-                    # if no distinct early peak is found
-                    onset_time = total_max_time
-                    onset_flux = total_max_flux
-                
-                # Extract corresponding effective energy
-                if total_max_time in df_channel.index:
-                    # Note that the effective energy may be different between onset and total max if temporally position just right
-                    eff_energy = df_channel.loc[total_max_time, 'DiffProtonEffectiveEnergy']
-                    
-                    # 3. Create the flag comparing the two timestamps
-                    is_single_peak = (onset_time == total_max_time)
-                    
-                    summary_data.append({
-                        'Sensor': sensor,  
-                        'ChannelNum': CHANNEL_TO_NUM.get(ch, 0),  
-                        'Channel': ch,  
-                        'EffectiveEnergy': eff_energy,
-                        'OnsetFlux': onset_flux,
-                        'OnsetTime': onset_time,
-                        'TotalMaxFlux': total_max_flux,
-                        'TotalMaxTime': total_max_time,
-                        'IsSinglePeak': is_single_peak  # True if onset and total max are the exact same point
-                    })
-
-df_summary = pd.DataFrame(summary_data).dropna()
-
-fig, ax = plt.subplots(figsize=(14, 6))
-
-markers = {0: 'o', 1: '^'}  
-
-# 1. Plot the scatter points
-for sensor_id in [0, 1]:
-    df_sens = df_summary[df_summary['Sensor'] == sensor_id]
-    if df_sens.empty:
+for idx, row in sep_catalog.iterrows():
+    start_raw = row['Begin_Time_UTC']
+    end_raw = row['End_Time_UTC']
+    
+    # 1. Skip events that don't have both a start and end time
+    if pd.isna(start_raw) or pd.isna(end_raw):
         continue
         
-    ax.scatter(
-        df_sens['EffectiveEnergy'], 
-        df_sens['TotalMaxFlux'], 
-        c=df_sens['ChannelNum'],  
-        cmap='turbo',
-        vmin=0, vmax=12,  # Adjusted to match the 0-12 mapping of the new channel list
-        s=150,
-        marker=markers[sensor_id],
-        edgecolor='black', 
-        linewidth=1.5, 
-        alpha=0.9,
-        zorder=3,
-        label=f'Sensor {sensor_id}'
-    )
-
-# 2. Add a single label per channel (placed above the highest point for that channel)
-for ch_num, group in df_summary.groupby('ChannelNum'):
-    label_x = group['EffectiveEnergy'].mean()
-    label_y = group['TotalMaxFlux'].max()
-    ch_name = group['Channel'].iloc[0]
+    # Ensure they are timezone-aware pandas datetimes
+    event_start = pd.to_datetime(start_raw)
+    event_end = pd.to_datetime(end_raw)
+    if event_start.tzinfo is None: event_start = event_start.tz_localize('UTC')
+    if event_end.tzinfo is None: event_end = event_end.tz_localize('UTC')
     
-    ax.annotate(
-        ch_name, 
-        (label_x, label_y),
-        xytext=(0, 12),             
-        textcoords='offset points',
-        ha='center',                
-        va='bottom',
-        weight='bold'
-    )
-
-t_start = start_date if start_date else "Dataset Start"
-t_end = end_date if end_date else "Dataset End"
-
-fig.suptitle(f'{sat_name.upper()} Peak Flux Spectrum (Sensors 0 & 1) | {t_start} to {t_end}')
-
-ax.set_xlabel('Effective Energy (MeV)')
-ax.set_ylabel('Maximum Flux (#/cm²/s/sr/MeV)')
-
-ax.yaxis.set_major_locator(ticker.LogLocator(base=10.0, numticks=20))
-ax.yaxis.set_major_formatter(ticker.LogFormatterMathtext())
-
-if not df_summary.empty:
-    ax.set_ylim(bottom=1e-3, top=df_summary['TotalMaxFlux'].max() * 2)
-
-ax.set_xscale('log')
-ax.set_yscale('log')
-
-ax.legend(title='Instrument')
-
-ax.grid(True, which='major', linestyle='-', linewidth=0.7, alpha=0.7, zorder=0)
-ax.grid(True, which='minor', linestyle=':', linewidth=0.5, alpha=0.4, zorder=0)
-
-plt.tight_layout()
-plt.show()
-
-# --- Generate the Time vs. Energy Plot ---
-fig, ax = plt.subplots(figsize=(14, 6))
-
-for sensor_id in [0, 1]:
-    df_sens = df_summary[df_summary['Sensor'] == sensor_id]
-    if df_sens.empty:
-        continue
-        
-    ax.scatter(
-        df_sens['TotalMaxTime'], 
-        df_sens['EffectiveEnergy'], 
-        c=df_sens['ChannelNum'],  
-        cmap='turbo',
-        vmin=0, vmax=12,  # Adjusted to match the 0-12 mapping
-        s=150,
-        marker=markers[sensor_id],
-        edgecolor='black', 
-        linewidth=1.5, 
-        alpha=0.9,
-        zorder=3,
-        label=f'Sensor {sensor_id}'
-    )
-
-# Annotate each point with its channel name
-for idx, row in df_summary.iterrows():
-    y_offset = -12 if row['Sensor'] == 1 else 10 
+    # 2. Apply the visual buffer and format into clean strings for the plotting function
+    plot_start = event_start - pre_event_buffer
+    plot_end = event_end + post_event_buffer
     
-    ax.annotate(
-        row['Channel'], 
-        (row['TotalMaxTime'], row['EffectiveEnergy']),
-        xytext=(0, y_offset), 
-        textcoords='offset points',
-        ha='center',
-        weight='bold'
-    )
-
-fig.suptitle(f'{sat_name.upper()} Time of Peak Flux vs. Effective Energy (Sensors 0 & 1)', weight='bold', y=0.92)
-
-ax.set_xlabel('Peak Time (UTC)')
-ax.set_ylabel('Effective Energy (MeV)')
-
-ax.set_yscale('log')
-
-# --- Custom Stateful Date Formatting Logic ---
-class SparseDateFormatter(ticker.Formatter):
-    def __call__(self, x, pos=None):
-        if pos is None or len(self.locs) == 0:
-            return ''
+    plot_start_str = plot_start.strftime('%Y-%m-%d %H:%M')
+    plot_end_str = plot_end.strftime('%Y-%m-%d %H:%M')
+    
+    # Create a clean folder name for this specific event (e.g., "Event_20230501_1430")
+    event_folder_name = f"Event_{event_start.strftime('%Y%m%d_%H%M')}"
+    event_save_dir = plot_output_base / event_folder_name
+    
+    print(f"\nProcessing {event_folder_name} (Index {idx})...")
+    
+    # 3. Loop through all active satellites and sensors
+    for satellite in goes_data.keys():
+        for sensor in goes_data[satellite].keys():
             
-        dt = mdates.num2date(x)
-        
-        if pos == 0:
-            year_str = dt.strftime('%Y')
-            date_str = dt.strftime('%m/%d')
-        else:
-            prev_dt = mdates.num2date(self.locs[pos - 1])
-            year_str = dt.strftime('%Y') if dt.year != prev_dt.year else ' '
-            date_str = dt.strftime('%m/%d') if dt.date() != prev_dt.date() else ' '
+            # Check if this specific satellite/sensor has data in this time window
+            # (Grabbing the first available channel just to check the index bounds)
+            first_ch = list(goes_data[satellite][sensor].keys())[0]
+            df_check = goes_data[satellite][sensor][first_ch]
             
-        time_str = dt.strftime('%H:%M')
-        
-        return f"{time_str}\n{date_str}\n{year_str}"
+            active_mask = (df_check.index >= plot_start) & (df_check.index <= plot_end)
+            
+            if not df_check[active_mask].empty:
+                print(f"  -> Plotting {satellite.upper()} Sensor {sensor}...")
+                
+                # 4. Call plotting function
+                plot_goes_flux(
+                    goes_data=goes_data,
+                    sat_name=satellite,
+                    sensor=sensor,
+                    start_date=plot_start_str,
+                    end_date=plot_end_str,
+                    averaging=plot_averaging,
+                    save_dir=event_save_dir,   # Save into this event's dedicated folder
+                    show_plot=False,           # CRITICAL: Keep False so it doesn't crash your browser/RAM
+                    clean_yaw=True             # Use the clean staggered E/W text labels
+                )
 
-ax.xaxis.set_major_formatter(SparseDateFormatter())
-plt.xticks(rotation=0, ha='center')
-
-ax.legend(title='Instrument')
-
-ax.grid(True, which='major', linestyle='-', linewidth=0.7, alpha=0.7, zorder=0)
-ax.grid(True, which='minor', linestyle=':', linewidth=0.5, alpha=0.4, zorder=0)
-
-plt.tight_layout()
-plt.show()
+print(f"\n{'-'*50}")
+print("ALL EVENT PLOTS GENERATED AND SAVED.")
+print(f"{'-'*50}")
