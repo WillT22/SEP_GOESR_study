@@ -27,7 +27,7 @@ SGPS_CHANNELS = ['P1', 'P2A', 'P2B', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8A', 'P8B',
 CHANNEL_TO_NUM = {ch: i for i, ch in enumerate(SGPS_CHANNELS)}
 
 # Define the base directory containing the satellite folders
-BASE_DATA_DIR = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data")
+BASE_DATA_DIR = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
 
 SATELLITES = ['goes16', 'goes17', 'goes18', 'goes19']
 
@@ -270,8 +270,149 @@ def plot_goes_flux(goes_data, sat_name, sensor, start_date=None, end_date=None, 
 for satellite in goes_data.keys():
     for sensor in goes_data[satellite].keys():
         plot_goes_flux(goes_data, satellite, sensor, 
-                       save_dir=r'C:\Users\Will\Box\SEP_Box\SGPS_data\data_figures',
+                       save_dir=r'C:\Users\wzt0020\Box\SEP_Box\SGPS_data\data_figures',
                        clean_yaw=True)
+
+
+#%% Find the mode of each satellite channel data
+# Set to 'orientation' to group by East/West, or 'sensor' to group by Sensor 0/1
+grouping_mode = 'orientation'  
+target_col = 'AvgDiffProtonFlux'
+
+# =============================================================================
+# DATA AGGREGATION & MODE CALCULATION
+# =============================================================================
+flux_agg = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+
+for sat_name, sensors in goes_data.items():
+    for sensor, channels in sensors.items():
+        for channel, df_channel in channels.items():
+            
+            if target_col in df_channel.columns and 'yaw_flip_flag' in df_channel.columns and not df_channel.empty:
+                
+                # Filter out zeroes, NaNs, and Maneuvering (1) states
+                valid_mask = (df_channel[target_col] > 0.0) & (df_channel['yaw_flip_flag'].isin([0, 2]))
+                df_valid = df_channel[valid_mask]
+                
+                if df_valid.empty:
+                    continue
+                
+                if grouping_mode == 'orientation':
+                    for state in [0, 2]:
+                        state_flux = df_valid[df_valid['yaw_flip_flag'] == state][target_col].dropna()
+                        if not state_flux.empty:
+                            if state == 0:
+                                orientation = 'West' if sensor == 0 else 'East'
+                            else:
+                                orientation = 'East' if sensor == 0 else 'West'
+                            flux_agg[sat_name][channel][orientation].append(state_flux)
+                
+                elif grouping_mode == 'sensor':
+                    sensor_flux = df_valid[target_col].dropna()
+                    if not sensor_flux.empty:
+                        flux_agg[sat_name][channel][sensor].append(sensor_flux)
+
+mode_records = []
+for sat_name, channels in flux_agg.items():
+    for channel, sub_groups in channels.items():
+        for sub_group, series_list in sub_groups.items():
+            
+            combined_flux = pd.concat(series_list, ignore_index=True)
+            modes = combined_flux.mode()
+            
+            if not modes.empty:
+                # --- Calculate the percentage ---
+                mode_val = modes.iloc[0]
+                total_count = len(combined_flux)
+                mode_count = (combined_flux == mode_val).sum()
+                mode_pct = (mode_count / total_count) * 100
+                
+                mode_records.append({
+                    'Satellite': sat_name.upper(),
+                    'Channel': channel,
+                    'SubGroup': sub_group,
+                    'Mode': mode_val,
+                    'Mode_Pct': mode_pct
+                })
+
+df_modes = pd.DataFrame(mode_records)
+df_modes['Channel_Num'] = df_modes['Channel'].map(CHANNEL_TO_NUM)
+df_modes = df_modes.sort_values(['Channel_Num', 'SubGroup', 'Satellite'])
+
+# =============================================================================
+# NESTED SUB-COLUMN HISTOGRAM PLOT
+# =============================================================================
+
+channels = sorted(df_modes['Channel'].unique(), key=lambda x: CHANNEL_TO_NUM.get(x, 99))
+satellites = sorted(df_modes['Satellite'].unique())
+
+# Dynamically set the sub-groups based on the selected mode
+if grouping_mode == 'orientation':
+    sub_groups = ['East', 'West']
+    title_group = 'Physical Orientation'
+else:
+    sub_groups = [0, 1]
+    title_group = 'Sensor Number'
+
+sat_colors = {'GOES16': '#1f77b4', 'GOES17': '#ff7f0e', 'GOES18': '#2ca02c', 'GOES19': '#d62728'}
+
+# 1. Initialize Figure
+fig, ax = plt.subplots(figsize=(18, 7.5))
+
+# Create Histogram
+channel_spacing = 2.5  
+x_indices = np.arange(len(channels)) * channel_spacing 
+bar_width = 0.25       
+group_spacing = 0.6    
+
+for i, ch in enumerate(channels):
+    for j, sg in enumerate(sub_groups):
+        
+        # Shift first group (East or Sensor 0) slightly left (-), second group slightly right (+)
+        cluster_center = x_indices[i] - group_spacing if j == 0 else x_indices[i] + group_spacing
+
+        # Determine the dynamic sub-label
+        if grouping_mode == 'orientation':
+            sg_label = 'E' if sg == 'East' else 'W'
+        else:
+            sg_label = f'S{sg}'
+
+        # East/West or S0/S1 Sub Labels
+        ax.text(cluster_center, -0.04, sg_label, transform=ax.get_xaxis_transform(), 
+                ha='center', va='top')
+        
+        for k, sat in enumerate(satellites):
+            sat_offset = (k - len(satellites)/2 + 0.5) * bar_width
+            bar_x = cluster_center + sat_offset
+            
+            val_df = df_modes[(df_modes['Channel'] == ch) & 
+                              (df_modes['SubGroup'] == sg) & 
+                              (df_modes['Satellite'] == sat)]
+            
+            if not val_df.empty:
+                val = val_df['Mode'].iloc[0]
+                label = sat if (i == 0 and j == 0) else ""
+                ax.bar(bar_x, val, width=bar_width, color=sat_colors.get(sat, 'black'), label=label)
+
+# 3. Formatting
+ax.set_yscale('log')
+ax.set_xticks(x_indices)
+
+ax.set_xticklabels(channels)
+ax.tick_params(axis='x', pad=40) 
+
+ax.set_ylabel('Mode of Avg Diff Proton Flux\n(#/cm²/s/sr/MeV)', labelpad=4)
+ax.set_title(f'Proton Flux Modes by {title_group}\n(Excluding Maneuvering and Missing Yaw Data)', fontsize=26, pad=10)
+
+# 4. Legend (Merged your two legend lines so deduplication and outside-placement both apply)
+handles, labels = ax.get_legend_handles_labels()
+by_label = dict(zip(labels, handles))
+ax.legend(by_label.values(), by_label.keys(), bbox_to_anchor=(1.01, 1), loc='upper left', borderaxespad=0., title="Satellite")
+
+ax.grid(axis='y', linestyle='--', alpha=0.6, linewidth=1.5)
+ax.margins(x=0.02)
+plt.tight_layout()
+plt.show()
 
 
 
@@ -365,61 +506,10 @@ for idx, row in sep_catalog.iterrows():
 print("Event end times calculated successfully.")
 
 # Define the output path (adjust the folder/filename as needed)
-output_file = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\updated_sep_catalog.csv")
+output_file = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\updated_sep_catalog.csv")
 # Export the DataFrame to a CSV file
 sep_catalog.to_csv(output_file, index=False)
 print(f"Updated SEP catalog saved successfully to: {output_file}")
-
-#%% Find the mode of each satellite channel data
-# Initialize the nested dictionary to store the modes dynamically
-sat_modes = defaultdict(lambda: defaultdict(dict))
-
-# Optional: Create a flat list to easily convert the results into a clean table later
-mode_records = []
-
-# Define which column you are finding the mode for
-target_col = 'AvgDiffProtonFlux'
-
-for sat_name, sensors in goes_data.items():
-    for sensor, channels in sensors.items():
-        for channel, df_channel in channels.items():
-            
-            # Ensure the column exists and the dataframe isn't empty to avoid errors
-            if target_col in df_channel.columns and not df_channel.empty:
-                
-                # Filter out zeros, NaNs, and negative fill/error values 
-                # (Physical flux cannot be negative, so > 0 isolates strict valid data)
-                valid_data = df_channel[df_channel[target_col] > 0.0][target_col].dropna()
-                
-                if not valid_data.empty:
-                    # .mode() returns a Series (in case of multi-modal ties), so extract the first value
-                    modes = valid_data.mode()
-                    
-                    if not modes.empty:
-                        mode_val = modes.iloc[0]
-                        
-                        # 1. Save to your nested dictionary
-                        sat_modes[sat_name][sensor][channel] = mode_val
-                        
-                        # 2. Append to the flat list for the tabular output
-                        mode_records.append({
-                            'Satellite': sat_name.upper(),
-                            'Sensor': sensor,
-                            'Channel': channel,
-                            'AvgDiffProtonFlux_Mode': mode_val
-                        })
-
-# Convert to a DataFrame for optimized viewing and exporting
-df_modes = pd.DataFrame(mode_records)
-
-# Sort strictly by Satellite, Sensor, and then the numeric channel order using your existing dictionary
-df_modes['Channel_Num'] = df_modes['Channel'].map(CHANNEL_TO_NUM)
-df_modes = df_modes.sort_values(['Satellite', 'Sensor', 'Channel_Num']).drop(columns=['Channel_Num'])
-
-print(f"\n{'-'*65}")
-print("MODES OF AVG DIFF PROTON FLUX BY SATELLITE & SENSOR")
-print(f"{'-'*65}")
-print(df_modes.to_string(index=False))
 
 
 #%% Plot the flux data for one energy channel as a function of time
