@@ -14,7 +14,7 @@ vars_to_keep_base = [
 ]
 
 # Load the NetCDF file into an xarray Dataset
-file_path = "C:\\Users\\wzt0020\\Box\\SEP_Box\\SGPS_data\\goes16\\sgps-l2-avg5m\\2025\\sci_sgps-l2-avg5m_g16_d20250101_v3-0-2.nc"
+file_path = r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\goes16\sgps-l2-avg5m\2021\sci_sgps-l2-avg5m_g16_d20211028_v2-0-0.nc"
 dataset = xr.open_dataset(file_path, engine="netcdf4")
 
 # Format the timestamp column name
