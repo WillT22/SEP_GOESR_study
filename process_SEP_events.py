@@ -423,6 +423,13 @@ for event_name, df_event in df_event_peaks.groupby('Event'):
             ax.set_ylabel('Effective Energy (MeV)')
             ax.set_yscale('log')
 
+            # Set explicit linear-style tick labels on the log y-axis
+            y_ticks = [1, 3, 10, 30, 100, 300]
+            ax.set_yticks(y_ticks)
+            ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
+            ax.yaxis.set_minor_formatter(ticker.NullFormatter())
+            ax.set_ylim(0.8,500)
+
             ax.xaxis.set_major_formatter(SparseDateFormatter())
             plt.xticks(rotation=0, ha='center')
 
