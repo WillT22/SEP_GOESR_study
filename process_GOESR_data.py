@@ -30,7 +30,7 @@ DURATION_CHANNELS = ['P4', 'P5', 'P6', 'P7', 'P8A', 'P8B', 'P8C', 'P9', 'P10']
 LOW_ENERGY_CHANNELS = ['P1', 'P2A', 'P2B', 'P3']
 
 # Define the base directory containing the satellite folders
-BASE_DATA_DIR = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
+BASE_DATA_DIR = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data")
 
 SATELLITES = ['goes16', 'goes17', 'goes18', 'goes19']
 
@@ -283,8 +283,24 @@ def plot_goes_flux(goes_data, sat_name, sensor, start_date=None, end_date=None,
     ax.set_xlabel('Time (UTC)')
     ax.set_ylabel('Flux (#/cm²/s/sr/MeV)')
 
-    ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left', borderaxespad=0.)
+    # Identify channels that actually have at least one valid data point in the plotted window
+    valid_channels = set(df_flux_plot.dropna(axis=1, how='all').columns)
+
+    # Keep only valid channels and non-channel items (like 'Event Duration')
+    handles, labels = ax.get_legend_handles_labels()
+    legend_elements = [
+        h for h, lbl in zip(handles, labels)
+        if (lbl in valid_channels) or (lbl not in df_flux_plot.columns)
+    ]
+    ax.legend(handles=legend_elements, bbox_to_anchor=(1.01, 1), loc='upper left', borderaxespad=0.)
     ax.margins(x=0, y=0)
+
+    # Set the y-axis upper bound to 2x the absolute max across all plotted channels
+    y_max = df_flux_plot.max().max()
+    if pd.notna(y_max) and y_max > 0:
+        ax.set_ylim(top=y_max * 2)
+
+    ax.grid(True, which="major", ls="--", alpha=0.5)
     plt.tight_layout()
 
     # --- 7. Save and Show ---
@@ -312,7 +328,7 @@ if PLOT_FULL:
     for satellite in goes_data.keys():
         for sensor in goes_data[satellite].keys():
             plot_goes_flux(goes_data, satellite, sensor, 
-                        save_dir=r'C:\Users\wzt0020\Box\SEP_Box\SGPS_data\data_figures',
+                        save_dir=r'C:\Users\Will\Box\SEP_Box\SGPS_data\data_figures',
                         clean_yaw=False)
 
 
@@ -358,7 +374,7 @@ CHANNEL_THRESHOLDS = {
 }
 threshold_array = np.array([CHANNEL_THRESHOLDS[ch] for ch in SGPS_CHANNELS])
 
-# At a 5-minute cadence, 6 points = 30 minutes, 12 points = 1 hour.
+# At a 5-minute cadence, 3 points = 30 minutes, 12 points = 1 hour.
 REQUIRED_CONSECUTIVE_POINTS = 3
 col_name = 'End_Time_UTC'
 
@@ -370,6 +386,17 @@ if col_name not in sep_catalog.columns:
     sep_catalog.insert(1, col_name, pd.Series(pd.NaT, index=sep_catalog.index, dtype='datetime64[ns, UTC]'))
 else:
     sep_catalog[col_name] = pd.Series(pd.NaT, index=sep_catalog.index, dtype='datetime64[ns, UTC]')
+
+# Insert each channel's end time column immediately after End_Time_UTC
+insert_pos = sep_catalog.columns.get_loc(col_name) + 1
+for ch in SGPS_CHANNELS:
+    ch_col = f'{ch}_End_Time'
+    if ch_col not in sep_catalog.columns:
+        sep_catalog.insert(insert_pos, ch_col, pd.Series(pd.NaT, index=sep_catalog.index, dtype='datetime64[ns, UTC]'))
+        insert_pos += 1
+    else:
+        sep_catalog[ch_col] = pd.Series(pd.NaT, index=sep_catalog.index, dtype='datetime64[ns, UTC]')
+        insert_pos = sep_catalog.columns.get_loc(ch_col) + 1
 
 # List to hold the comprehensive data for the Parquet file
 multi_channel_records = []
@@ -408,6 +435,7 @@ for idx, row in sep_catalog.iterrows():
     
     event_record = {'Begin_Time_UTC': event_start}
     valid_duration_end_times = []
+    has_satellite_data = False  # Track whether ANY satellite has valid data for this event
     
     # 3. Calculate actual decay only for the core ~>10 MeV channels
     for ch in DURATION_CHANNELS:
@@ -422,8 +450,10 @@ for idx, row in sep_catalog.iterrows():
                     
                     df_ch = df_ch[~df_ch.index.duplicated(keep='last')].sort_index()
                     active_mask = (df_ch.index >= event_start) & (df_ch.index <= min_end_time)
-                    
-                    if not df_ch[active_mask].empty:
+
+                    if not df_ch[active_mask].empty and df_ch.loc[active_mask, 'AvgDiffProtonFlux'].notna().any():
+                        has_satellite_data = True
+                        
                         time_mask = (df_ch.index > min_end_time) & (df_ch.index <= max_end_time)
                         df_window = df_ch[time_mask]
                         
@@ -447,22 +477,28 @@ for idx, row in sep_catalog.iterrows():
             
         event_record[f'{ch}_End_Time'] = final_ch_end_time
 
-    # 4. Establish the Master End Time from the core channels
+# 4. Establish the Master End Time from the core channels
     if valid_duration_end_times:
         # Trust the max of the healthy channels that actually decayed
         master_end_time = max(valid_duration_end_times)
-    else:
-        # Bleed-over fallback: if NO channels dipped, use the boundary cutoff
+    elif has_satellite_data:
+        # Bleed-over fallback: data existed, but NO channels dipped before the cutoff
         master_end_time = max_end_time
-        
-    # Save to the main catalog for CSV export and plot shading
-    sep_catalog.loc[idx, col_name] = master_end_time
+    else:
+        # No satellite data existed during this event window; leave blank
+        master_end_time = pd.NaT
 
-    # 5. Force ANY channel that failed to dip (or was skipped) to inherit the Master End Time ---
+    sep_catalog.loc[idx, 'End_Time_UTC'] = master_end_time
+    event_record['End_Time_UTC'] = master_end_time
+
+    # 5. Force ANY channel that failed to dip (or was skipped) to inherit the Master End Time
     for ch in SGPS_CHANNELS:
-        # If the channel is currently NaT (because it didn't dip, or is P1/P2A/P2B/P3)
-        if pd.isna(event_record.get(f'{ch}_End_Time')):
-            event_record[f'{ch}_End_Time'] = master_end_time
+        ch_col = f'{ch}_End_Time'
+        if pd.isna(event_record.get(ch_col)):
+            event_record[ch_col] = master_end_time
+            
+        # Save directly into sep_catalog for CSV export
+        sep_catalog.loc[idx, ch_col] = event_record[ch_col]
 
     multi_channel_records.append(event_record)
 
@@ -471,7 +507,7 @@ print("Event end times calculated successfully.")
 # =============================================================================
 # EXPORT DATA
 # =============================================================================
-base_out_dir = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
+base_out_dir = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data")
 
 # Export 1: The standard CSV with only the P4 end time
 csv_output_file = base_out_dir / "updated_sep_catalog.csv"
@@ -487,7 +523,7 @@ print(f"Multi-channel end time catalog saved to: {parquet_output_file}")
 #%% Plot all events
 # --- Configuration ---
 # Set the base directory where you want the plot folders to go
-plot_output_base = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\Event_Plots")
+plot_output_base = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\Event_Plots")
 plot_output_base.mkdir(parents=True, exist_ok=True)
 
 # Define a visual buffer so the plot doesn't start/end exactly on the event boundaries
@@ -513,14 +549,17 @@ for idx, row in sep_catalog.iterrows():
     event_end = pd.to_datetime(end_raw)
     if event_start.tzinfo is None: event_start = event_start.tz_localize('UTC')
     if event_end.tzinfo is None: event_end = event_end.tz_localize('UTC')
-    event_start_str = event_start.strftime('%Y-%m-%d %H:%M')
+
+    time_difference = pd.Timedelta(hours=3)
+    
+    event_start_str = (event_start - time_difference).strftime('%Y-%m-%d %H:%M')
     event_end_str = event_end.strftime('%Y-%m-%d %H:%M')
     
     # 2. Apply the visual buffer and format into clean strings for the plotting function
     plot_start = event_start - pre_event_buffer
     plot_end = event_end + post_event_buffer
     
-    plot_start_str = plot_start.strftime('%Y-%m-%d %H:%M')
+    plot_start_str = (plot_start - time_difference).strftime('%Y-%m-%d %H:%M')
     plot_end_str = plot_end.strftime('%Y-%m-%d %H:%M')
     
     # Create a clean folder name for this specific event (e.g., "Event_20230501_1430")
@@ -553,7 +592,7 @@ for idx, row in sep_catalog.iterrows():
                     averaging=plot_averaging,
                     save_dir=event_save_dir,   # Save into this event's dedicated folder
                     show_plot=False,           # CRITICAL: Keep False so it doesn't crash your browser/RAM
-                    clean_yaw=True,             # Use the clean staggered E/W text labels
+                    clean_yaw=False,           
                     vline_start=event_start_str,
                     vline_end=event_end_str
                 )
@@ -563,20 +602,26 @@ print("ALL EVENT PLOTS GENERATED AND SAVED.")
 print(f"{'-'*50}")
 
 #%% Save all event data excluding missing or 1 yaw_flip_flags
-data_output_base = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\Event_Data")
+data_output_base = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\Event_Data")
 data_output_base.mkdir(parents=True, exist_ok=True)
 
 print(f"Extracting raw event data for {len(df_all_channels)} catalog entries...")
 
 for idx, row in df_all_channels.iterrows():
-    
+      
     # Get the global start time for the event
     global_start = pd.to_datetime(row['Begin_Time_UTC'])
     if pd.isna(global_start):
         continue
-        
     if global_start.tzinfo is None: 
         global_start = global_start.tz_localize('UTC')
+
+    # Get the global end time for the event
+    global_end = pd.to_datetime(row['End_Time_UTC'])
+    if pd.isna(global_end):
+        continue
+    if global_end.tzinfo is None: 
+        global_end = global_end.tz_localize('UTC')
         
     event_str = global_start.strftime('%Y%m%d_%H%M')
     
@@ -591,25 +636,10 @@ for idx, row in df_all_channels.iterrows():
                 if ch in goes_data[sat][sensor]:
                     df_ch = goes_data[sat][sensor][ch]
                     
-                    # 1. Determine Start Time (Fallback to global if a channel-specific start isn't defined)
-                    ch_start_col = f'{ch}_Begin_Time'
-                    if ch_start_col in row and pd.notna(row[ch_start_col]):
-                        start_t = pd.to_datetime(row[ch_start_col])
-                    else:
-                        start_t = global_start
-                        
-                    # 2. Determine End Time
-                    ch_end_col = f'{ch}_End_Time'
-                    if ch_end_col in row and pd.notna(row[ch_end_col]):
-                        end_t = pd.to_datetime(row[ch_end_col])
-                    else:
-                        # Skip this channel entirely if it has no valid end time for this event
-                        continue
-                        
-                    if start_t.tzinfo is None: start_t = start_t.tz_localize('UTC')
-                    if end_t.tzinfo is None: end_t = end_t.tz_localize('UTC')
+                    # Apply the 24-hour buffer ONLY for the data extraction bounds
+                    start_t = global_start - pd.Timedelta(hours=24)
+                    end_t = global_end + pd.Timedelta(hours=24)
                     
-                    # 3. Slice the data precisely to this channel's start/end window
                     df_sliced = df_ch.loc[start_t:end_t]
                     
                     if not df_sliced.empty:
@@ -621,9 +651,11 @@ for idx, row in df_all_channels.iterrows():
                             sensor_event_data[f'{ch}_Uncert'] = df_sliced['AvgDiffProtonFluxUncert']
                         
                         # Grab the yaw flag just once for this sensor, since it applies to all channels
-                        if not yaw_extracted and 'yaw_flip_flag' in df_sliced.columns:
-                            sensor_event_data['yaw_flip_flag'] = df_sliced['yaw_flip_flag']
-                            yaw_extracted = True
+                        if 'yaw_flip_flag' in df_sliced.columns:
+                            if 'yaw_flip_flag' not in sensor_event_data:
+                                sensor_event_data['yaw_flip_flag'] = df_sliced['yaw_flip_flag']
+                            else:
+                                sensor_event_data['yaw_flip_flag'] = sensor_event_data['yaw_flip_flag'].combine_first(df_sliced['yaw_flip_flag'])
             
             # 4. If we successfully extracted data for this sat/sensor, combine and save
             if sensor_event_data:
@@ -648,4 +680,3 @@ for idx, row in df_all_channels.iterrows():
 print(f"\n{'-'*50}")
 print("ALL EVENT PARQUET FILES SAVED SUCCESSFULLY.")
 print(f"{'-'*50}")
-# %%
