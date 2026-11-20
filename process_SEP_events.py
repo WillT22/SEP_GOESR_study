@@ -32,7 +32,7 @@ CHANNEL_THRESHOLDS = {
 
 
 # Import updated SEP event catalog
-catalog_path = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\updated_sep_catalog.csv")  # Adjust path if needed
+catalog_path = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\updated_sep_catalog.csv")  # Adjust path if needed
 sep_catalog = pd.read_csv(catalog_path)
 sep_catalog.columns = sep_catalog.columns.str.strip()
 
@@ -41,9 +41,17 @@ sep_catalog['Begin_Time_UTC'] = pd.to_datetime(sep_catalog['Begin_Time_UTC'], ut
 sep_catalog['Event_Folder'] = 'Event_' + sep_catalog['Begin_Time_UTC'].dt.strftime('%Y%m%d_%H%M')
 
 
+# Import quiet lookup data
+df_quiet = pd.read_csv(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\quiet_background_stats.csv")
+quiet_lookup = {
+    (row.Satellite, row.Sensor, row.Channel, row.YearMonth): (row.QuietMedian, row.QuietSigma)
+    for row in df_quiet.itertuples(index=False)
+}
+
+
 #%% From GOES data, import the relevant dates for each satellite
 # 1. Define the base directory where the event data was saved
-data_input_base = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\Event_Data")
+data_input_base = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\Event_Data")
 
 # 2. Initialize a nested dictionary to hold all the event data
 # Structure: loaded_events['Event_YYYYMMDD_HHMM']['goes16'][0] = DataFrame
@@ -87,7 +95,7 @@ print(f"Successfully loaded {len(loaded_events)} events into memory.")
 time_difference = pd.Timedelta(hours=3)
 
 # --- Tunable Noise-Rejection Parameters ---
-N_SIGMA = 5.0               # Peak must be at least 5-sigma above pre-event background
+N_SIGMA = 3.0               # Peak must be at least 3-sigma above pre-event background
 MIN_RATIO = 2.0             # Peak must be at least 2x the background median
 MIN_POINTS_ABOVE_BG = 3     # Minimum points above (bg + 3*sigma) to reject single-point spikes
 
@@ -162,18 +170,20 @@ for event_name, satellites in loaded_events.items():
                 # --- 2. Test Whether a Discernible Peak Exists ---
                 total_max_time = flux_series.idxmax()
                 total_max_flux = flux_series.max()
+                event_ym = event_row['Begin_Time_UTC'].strftime('%Y-%m')
                 ch_threshold = CHANNEL_THRESHOLDS.get(ch, 1e-3)
 
-                noise_ceiling = max(bg_median + N_SIGMA * bg_sigma, bg_median * MIN_RATIO)
-                points_above_bg = (flux_series > (bg_median + 3.0 * bg_sigma)).sum()
-
-                has_real_peak = (
-                    (total_max_flux > ch_threshold) and
-                    (total_max_flux > noise_ceiling) and
-                    (points_above_bg >= MIN_POINTS_ABOVE_BG)
+                q_median, q_sigma = quiet_lookup.get(
+                    (sat_name.upper(), sensor, ch, event_ym),
+                    (ch_threshold, 0.0)
                 )
 
+                # Use whichever baseline is higher: your physical threshold or that month's actual quiet median
+                baseline = max(ch_threshold, q_median)
+                has_real_peak = total_max_flux > (baseline + N_SIGMA * q_sigma)
+
                 energy_col = f'{ch}_Energy'
+                eff_energy = df_window.loc[total_max_time, energy_col] if energy_col in df_window.columns else np.nan
 
                 if has_real_peak:
                     # Calculate the Onset (Prompt) Peak
@@ -188,17 +198,12 @@ for event_name, satellites in loaded_events.items():
                         onset_flux = total_max_flux
                     
                     is_single_peak = (onset_time == total_max_time)
-                    eff_energy = df_window.loc[total_max_time, energy_col] if energy_col in df_window.columns else np.nan
                     is_background = False
                 else:
-                    # No discernible peak: fall back to the average flux level
-                    avg_flux = flux_series.mean()
-                    total_max_flux = avg_flux
-                    onset_flux = avg_flux
-                    total_max_time = pd.NaT
-                    onset_time = pd.NaT
+                    # No discernible peak: keep the raw max, but flag as background
+                    onset_flux = total_max_flux
+                    onset_time = total_max_time
                     is_single_peak = True
-                    eff_energy = df_window[energy_col].median() if energy_col in df_window.columns else np.nan
                     is_background = True
                 
                 summary_data.append({
@@ -221,9 +226,23 @@ for event_name, satellites in loaded_events.items():
 df_event_peaks = pd.DataFrame(summary_data)
 df_event_peaks = df_event_peaks.sort_values(['Event', 'Satellite', 'Orientation', 'ChannelNum']).reset_index(drop=True)
 
+# --- Save Summary Data ---
+output_dir = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# 1. Parquet (recommended for reloading into Python/pandas with exact dtypes & UTC timezones)
+parquet_path = output_dir / "SEP_event_peaks_summary.parquet"
+df_event_peaks.to_parquet(parquet_path, index=False)
+
+# 2. CSV (for quick visual inspection in Excel or sharing)
+csv_path = output_dir / "SEP_event_peaks_summary.csv"
+df_event_peaks.to_csv(csv_path, index=False)
+
+print(f"Saved {len(df_event_peaks)} rows to:\n  - {parquet_path}\n  - {csv_path}")
+
 #%% Plot the peak flux for each event
 # --- Configuration & Folder Setup ---
-base_plot_dir = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\Event_Spectra_Plots")
+base_plot_dir = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\Event_Spectra_Plots")
 onset_dir = base_plot_dir / "Onset_Peak_Spectra"
 absolute_dir = base_plot_dir / "Absolute_Peak_Spectra"
 
@@ -255,16 +274,37 @@ for event_name, df_event in df_event_peaks.groupby('Event'):
             # Sort just to guarantee the line draws left-to-right correctly
             df_group = df_group.sort_values('ChannelNum')
             
-            # Style: Match satellite color. Solid line/Circle for West, Dashed line/Square for East
             color = sat_colors.get(sat, 'black')
             linestyle = '-' if orientation == 'West' else '--'
             marker = 'o' if orientation == 'West' else 's'
-            
             label = f"{sat} ({orientation})"
             
-            ax.plot(df_group['ChannelNum'], df_group[peak_type], 
-                    color=color, linestyle=linestyle, marker=marker, markersize=10,
-                      linewidth=1.5, label=label, alpha=0.8)
+            # Split into real peaks vs. background
+            is_bg = df_group['IsBackground'].fillna(False)
+            df_real = df_group[~is_bg]
+            df_bg = df_group[is_bg]
+
+            # 1. Faint connecting line across ALL channels (keeps the spectrum continuous)
+            ax.plot(df_group['ChannelNum'], df_group[peak_type],
+                    color=color, linestyle=linestyle, linewidth=1.2, alpha=0.25, zorder=2)
+
+            # 2. Real peaks: full color, solid fill, high visibility
+            if not df_real.empty:
+                ax.plot(df_real['ChannelNum'], df_real[peak_type],
+                        color=color, linestyle='none', marker=marker, markersize=10,
+                        linewidth=1.5, label=label, alpha=0.9, zorder=4)
+                # Connect consecutive real peaks with a full-strength line
+                real_series = df_group[peak_type].where(~is_bg)
+                ax.plot(df_group['ChannelNum'], real_series,
+                        color=color, linestyle=linestyle, linewidth=1.8, alpha=0.85, zorder=3)
+
+            # 3. Background points: gray-filled, faded satellite-colored border
+            if not df_bg.empty:
+                bg_label = label if df_real.empty else None  # Keep in legend if all points are background
+                ax.plot(df_bg['ChannelNum'], df_bg[peak_type],
+                        color=color, linestyle='none', marker=marker, markersize=9,
+                        markerfacecolor='lightgray', markeredgecolor=color, markeredgewidth=1.2,
+                        alpha=0.4, label=bg_label, zorder=3)
 
         energy_labels = []
         for ch in SGPS_CHANNELS:
@@ -301,7 +341,14 @@ for event_name, df_event in df_event_peaks.groupby('Event'):
                      fontweight='bold', pad=15)
         
         ax.grid(True, which="major", ls="--", alpha=0.5)
-        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0., title="Satellites")
+        handles, labels = ax.get_legend_handles_labels()
+        handles.append(
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='lightgray',
+                   markeredgecolor='gray', markeredgewidth=1.2, markersize=9,
+                   alpha=0.5, label='Background')
+        )
+        ax.legend(handles=handles, bbox_to_anchor=(1.02, 1), loc='upper left',
+                  borderaxespad=0., title="Satellites")
         
         plt.tight_layout()
         
@@ -317,7 +364,7 @@ print(f"\n{'-'*50}")
 print("ALL SPECTRA PLOTS GENERATED AND SAVED SAFELY.")
 print(f"{'-'*50}")
 
-#%%
+#%% Plot the effective energies as a function of time
 # --- Custom Stateful Date Formatting Logic ---
 class SparseDateFormatter(ticker.Formatter):
     def __call__(self, x, pos=None):
@@ -345,7 +392,7 @@ class SparseDateFormatter(ticker.Formatter):
 
 
 # Define your base output directory for plots
-plot_output_base = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\Energy_Time_Plots")
+plot_output_base = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\Energy_Time_Plots")
 
 # --- Plot Configuration ---
 plot_configs = {
@@ -384,33 +431,64 @@ for event_name, df_event in df_event_peaks.groupby('Event'):
                 df_sens = df_plot[df_plot['Orientation'] == orientation]
                 if df_sens.empty:
                     continue
-                    
-                ax.scatter(
-                    df_sens[time_col], 
-                    df_sens['EffectiveEnergy'], 
-                    c=df_sens['ChannelNum'],  
-                    cmap='turbo',
-                    vmin=0, vmax=12,  
-                    s=150,
-                    marker=markers.get(orientation, 'o'),
-                    edgecolor='black', 
-                    linewidth=1.5, 
-                    alpha=0.9,
-                    zorder=3,
-                    label=f'{orientation}'
-                )
 
-            # Annotate each point with its channel name, staggered by orientation
+                is_bg = df_sens['IsBackground'].fillna(False) if 'IsBackground' in df_sens.columns else pd.Series(False, index=df_sens.index)
+                df_real = df_sens[~is_bg]
+                df_bg = df_sens[is_bg]
+                m = markers.get(orientation, 'o')
+
+                # 1. Real peaks: full turbo color, black border, high visibility
+                if not df_real.empty:
+                    ax.scatter(
+                        df_real[time_col],
+                        df_real['EffectiveEnergy'],
+                        c=df_real['ChannelNum'],
+                        cmap='turbo',
+                        vmin=0, vmax=12,
+                        s=150,
+                        marker=m,
+                        edgecolor='black',
+                        linewidth=1.5,
+                        alpha=0.9,
+                        zorder=4,
+                        label=f'{orientation}'
+                    )
+
+                # 2. Background points: same turbo channel colors, but faded/see-through
+                if not df_bg.empty:
+                    bg_label = f'{orientation}' if df_real.empty else None
+                    ax.scatter(
+                        df_bg[time_col],
+                        df_bg['EffectiveEnergy'],
+                        c=df_bg['ChannelNum'],
+                        cmap='turbo',
+                        vmin=0, vmax=12,
+                        s=130,
+                        marker=m,
+                        edgecolor='black',
+                        linewidth=1.2,
+                        alpha=0.3,
+                        zorder=2,
+                        label=bg_label
+                    )
+
+            # Annotate each point with its channel name: East to the right, West to the left
             for idx, row in df_plot.iterrows():
-                y_offset = -12 if row['Orientation'] == 'West' else 10 
-                
+                is_west = row['Orientation'] == 'West'
+                x_offset = -10 if is_west else 10
+                h_align = 'right' if is_west else 'left'
+                is_bg_row = bool(row.get('IsBackground', False))
+
                 ax.annotate(
-                    row['Channel'], 
+                    row['Channel'],
                     (row[time_col], row['EffectiveEnergy']),
-                    xytext=(0, y_offset), 
+                    xytext=(x_offset, 0),
                     textcoords='offset points',
-                    ha='center',
-                    weight='bold'
+                    ha=h_align,
+                    va='center',
+                    color='gray' if is_bg_row else 'black',
+                    alpha=0.5 if is_bg_row else 1.0,
+                    weight='normal' if is_bg_row else 'bold'
                 )
 
             # Format Titles and Labels
@@ -513,23 +591,33 @@ def plot_event_flux_with_peaks(df_event, sat_name, sensor, df_peaks, event_name,
         
         if ch in df_flux_plot.columns:
             color = line_colors.get(ch, 'black')
+            is_bg = bool(peak_row.get('IsBackground', False))
             
-            # Absolute Max Peak: Solid channel-colored circle with black outline + white halo
+            # Styling based on whether the channel is a real peak or background
+            marker_alpha = 0.35 if is_bg else 1.0
+            edge_lw = 1.2 if is_bg else 1.5
+            z_marker = 4 if is_bg else 6
+            
+            # Absolute Max Peak
             abs_time = peak_row['TotalMaxTime']
             abs_flux = peak_row['TotalMaxFlux']
             if pd.notna(abs_time) and (df_flux_plot.index.min() <= abs_time <= df_flux_plot.index.max()):
-                ax.scatter(abs_time, abs_flux, s=220, color='white', alpha=0.9, zorder=5)
-                ax.scatter(abs_time, abs_flux, s=110, marker='o', facecolors=color, 
-                           edgecolors='black', linewidths=1.5, zorder=6)
+                if not is_bg:
+                    ax.scatter(abs_time, abs_flux, s=220, color='white', alpha=0.9, zorder=5)
+                ax.scatter(abs_time, abs_flux, s=95 if is_bg else 110, marker='o', 
+                           facecolors=color, edgecolors='black', linewidths=edge_lw, 
+                           alpha=marker_alpha, zorder=z_marker)
 
-            # Onset Max Peak: Solid channel-colored diamond with black outline + white halo
+            # Onset Max Peak (only if distinct)
             if not peak_row['IsSinglePeak']:
                 onset_time = peak_row['OnsetTime']
                 onset_flux = peak_row['OnsetFlux']
                 if pd.notna(onset_time) and (df_flux_plot.index.min() <= onset_time <= df_flux_plot.index.max()):
-                    ax.scatter(onset_time, onset_flux, s=200, marker='D', color='white', alpha=0.9, zorder=5)
-                    ax.scatter(onset_time, onset_flux, s=100, marker='D', facecolors=color, 
-                               edgecolors='black', linewidths=1.5, zorder=6)
+                    if not is_bg:
+                        ax.scatter(onset_time, onset_flux, s=200, marker='D', color='white', alpha=0.9, zorder=5)
+                    ax.scatter(onset_time, onset_flux, s=85 if is_bg else 100, marker='D', 
+                               facecolors=color, edgecolors='black', linewidths=edge_lw, 
+                               alpha=marker_alpha, zorder=z_marker)
 
     # --- 6. Add Yaw Flip Lines & Orientation Labels ---
     if has_yaw and not df_yaw.empty:
@@ -582,7 +670,7 @@ def plot_event_flux_with_peaks(df_event, sat_name, sensor, df_peaks, event_name,
     ax.set_xlabel('Time (UTC)')
     ax.set_ylabel('Flux (#/cm²/s/sr/MeV)')
 
-# Identify channels that actually have at least one valid data point in the plotted window
+    # Identify channels that actually have at least one valid data point in the plotted window
     valid_channels = set(df_flux_plot.dropna(axis=1, how='all').columns)
 
     # Keep only valid channels and non-channel items (like 'Event Duration')
@@ -597,7 +685,9 @@ def plot_event_flux_with_peaks(df_event, sat_name, sensor, df_peaks, event_name,
         Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=9, 
                markeredgecolor='black', markeredgewidth=1.5, label='Absolute Max', alpha=0.9),
         Line2D([0], [0], marker='D', color='w', markerfacecolor='gray', markersize=8, 
-               markeredgecolor='black', markeredgewidth=1.5, label='Onset Max', alpha=0.9)
+               markeredgecolor='black', markeredgewidth=1.5, label='Onset Max', alpha=0.9),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markersize=8, 
+               markeredgecolor='black', markeredgewidth=1.2, label='Background', alpha=0.5)
     ])
 
     ax.legend(handles=legend_elements, bbox_to_anchor=(1.01, 1), loc='upper left', borderaxespad=0.)
@@ -627,7 +717,7 @@ def plot_event_flux_with_peaks(df_event, sat_name, sensor, df_peaks, event_name,
 
 
 #%% Call function, plot maxima
-plot_output_base = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\Event_Plots_Maxima")
+plot_output_base = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\Event_Plots_Maxima")
 plot_output_base.mkdir(parents=True, exist_ok=True)
 
 pre_event_buffer = pd.Timedelta(hours=24)

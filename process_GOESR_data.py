@@ -29,8 +29,15 @@ CHANNEL_TO_NUM = {ch: i for i, ch in enumerate(SGPS_CHANNELS)}
 DURATION_CHANNELS = ['P4', 'P5', 'P6', 'P7', 'P8A', 'P8B', 'P8C', 'P9', 'P10']
 LOW_ENERGY_CHANNELS = ['P1', 'P2A', 'P2B', 'P3']
 
+CHANNEL_THRESHOLDS = {
+    'P1': 1e-1, 'P2A': 1e-1, 'P2B': 1e-1,
+    'P3': 1e-2, 'P4': 1e-2, 'P5': 1e-2,
+    'P6': 1e-3, 'P7': 1e-3, 'P8A': 1e-3,
+    'P8B': 1e-3, 'P8C': 1e-3, 'P9': 1e-3, 'P10': 1e-3
+}
+
 # Define the base directory containing the satellite folders
-BASE_DATA_DIR = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data")
+BASE_DATA_DIR = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
 
 SATELLITES = ['goes16', 'goes17', 'goes18', 'goes19']
 
@@ -328,9 +335,60 @@ if PLOT_FULL:
     for satellite in goes_data.keys():
         for sensor in goes_data[satellite].keys():
             plot_goes_flux(goes_data, satellite, sensor, 
-                        save_dir=r'C:\Users\Will\Box\SEP_Box\SGPS_data\data_figures',
+                        save_dir=r'C:\Users\wzt0020\Box\SEP_Box\SGPS_data\data_figures',
                         clean_yaw=False)
 
+
+#%% Extract moving noise threshold for each channel by month
+quiet_records = []
+
+for sat in goes_data.keys():
+    for sensor in goes_data[sat].keys():
+        for ch in SGPS_CHANNELS:
+            if ch not in goes_data[sat][sensor]:
+                continue
+                
+            df_ch = goes_data[sat][sensor][ch]
+            flux = df_ch['AvgDiffProtonFlux'].replace(0, np.nan).dropna()
+            flux = flux[flux > 0.0]
+            
+            # Optional: exclude maneuvering (yaw_flip_flag == 1) if present
+            if 'yaw_flip_flag' in df_ch.columns:
+                valid_yaw = df_ch['yaw_flip_flag'].isin([0, 2])
+                flux = flux[valid_yaw.reindex(flux.index, fill_value=False)]
+
+            if flux.empty:
+                continue
+
+            ch_threshold = CHANNEL_THRESHOLDS.get(ch, 1e-3)
+
+            # Group by Year-Month (use 'Q' for quarterly if you prefer larger windows)
+            for period, group in flux.groupby(flux.index.strftime('%Y-%m')):
+                # Isolate quiet time: points below channel threshold
+                quiet = group[group <= ch_threshold]
+                
+                # Fallback if an entire month was elevated or threshold drifted
+                if len(quiet) < 20:
+                    quiet = group[group <= group.quantile(0.25)]
+                
+                if len(quiet) < 5:
+                    continue
+
+                q_median = quiet.median()
+                mad = (quiet - q_median).abs().median()
+                q_sigma = 1.4826 * mad if mad > 0 else quiet.std()
+
+                quiet_records.append({
+                    'Satellite': sat.upper(),
+                    'Sensor': sensor,
+                    'Channel': ch,
+                    'YearMonth': period,  # Already formatted as '2024-05'
+                    'QuietMedian': q_median,
+                    'QuietSigma': 0.0 if pd.isna(q_sigma) else q_sigma
+                })
+
+df_quiet_stats = pd.DataFrame(quiet_records)
+df_quiet_stats.to_csv(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\quiet_background_stats.csv", index=False)
 
 #%% Import SEP Catalog
 # =======================================================
@@ -507,7 +565,7 @@ print("Event end times calculated successfully.")
 # =============================================================================
 # EXPORT DATA
 # =============================================================================
-base_out_dir = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data")
+base_out_dir = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
 
 # Export 1: The standard CSV with only the P4 end time
 csv_output_file = base_out_dir / "updated_sep_catalog.csv"
@@ -523,7 +581,7 @@ print(f"Multi-channel end time catalog saved to: {parquet_output_file}")
 #%% Plot all events
 # --- Configuration ---
 # Set the base directory where you want the plot folders to go
-plot_output_base = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\Event_Plots")
+plot_output_base = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\Event_Plots")
 plot_output_base.mkdir(parents=True, exist_ok=True)
 
 # Define a visual buffer so the plot doesn't start/end exactly on the event boundaries
@@ -602,7 +660,7 @@ print("ALL EVENT PLOTS GENERATED AND SAVED.")
 print(f"{'-'*50}")
 
 #%% Save all event data excluding missing or 1 yaw_flip_flags
-data_output_base = Path(r"C:\Users\Will\Box\SEP_Box\SGPS_data\Event_Data")
+data_output_base = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\Event_Data")
 data_output_base.mkdir(parents=True, exist_ok=True)
 
 print(f"Extracting raw event data for {len(df_all_channels)} catalog entries...")
