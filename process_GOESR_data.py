@@ -4,9 +4,6 @@ import numpy as np
 from pathlib import Path
 from collections import defaultdict
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-import matplotlib.dates as mdates
-from scipy.signal import find_peaks
 
 FONT_SIZE = 20
 plt.rcParams.update({
@@ -352,39 +349,56 @@ for sat in goes_data.keys():
             flux = df_ch['AvgDiffProtonFlux'].replace(0, np.nan).dropna()
             flux = flux[flux > 0.0]
             
+            # Keep flux and uncertainty aligned
+            uncert_col = 'AvgDiffProtonFluxUncert'
+            cols = ['AvgDiffProtonFlux', uncert_col] if uncert_col in df_ch.columns else ['AvgDiffProtonFlux']
+            df_sub = df_ch[cols].copy()
+            df_sub['AvgDiffProtonFlux'] = df_sub['AvgDiffProtonFlux'].replace(0, np.nan)
+            df_sub = df_sub.dropna(subset=['AvgDiffProtonFlux'])
+            df_sub = df_sub[df_sub['AvgDiffProtonFlux'] > 0.0]
+
             # Optional: exclude maneuvering (yaw_flip_flag == 1) if present
             if 'yaw_flip_flag' in df_ch.columns:
                 valid_yaw = df_ch['yaw_flip_flag'].isin([0, 2])
-                flux = flux[valid_yaw.reindex(flux.index, fill_value=False)]
+                df_sub = df_sub[valid_yaw.reindex(df_sub.index, fill_value=False)]
 
-            if flux.empty:
+            if df_sub.empty:
                 continue
 
             ch_threshold = CHANNEL_THRESHOLDS.get(ch, 1e-3)
 
-            # Group by Year-Month (use 'Q' for quarterly if you prefer larger windows)
-            for period, group in flux.groupby(flux.index.strftime('%Y-%m')):
-                # Isolate quiet time: points below channel threshold
-                quiet = group[group <= ch_threshold]
+            for period, group in df_sub.groupby(df_sub.index.strftime('%Y-%m')):
+                quiet = group[group['AvgDiffProtonFlux'] <= ch_threshold]
                 
-                # Fallback if an entire month was elevated or threshold drifted
                 if len(quiet) < 20:
-                    quiet = group[group <= group.quantile(0.25)]
+                    quiet = group[group['AvgDiffProtonFlux'] <= group['AvgDiffProtonFlux'].quantile(0.25)]
                 
                 if len(quiet) < 5:
                     continue
 
-                q_median = quiet.median()
-                mad = (quiet - q_median).abs().median()
-                q_sigma = 1.4826 * mad if mad > 0 else quiet.std()
+                q_flux = quiet['AvgDiffProtonFlux']
+                q_median = q_flux.median()
+                mad = (q_flux - q_median).abs().median()
+                q_sigma_emp = 1.4826 * mad if mad > 0 else q_flux.std()
+                q_sigma_emp = 0.0 if pd.isna(q_sigma_emp) else q_sigma_emp
+
+                # Floor QuietSigma with the median reported measurement uncertainty
+                if uncert_col in quiet.columns:
+                    q_uncert_med = quiet[uncert_col].replace(0, np.nan).median()
+                    q_uncert_med = 0.0 if pd.isna(q_uncert_med) else q_uncert_med
+                else:
+                    q_uncert_med = 0.0
+
+                q_sigma = max(q_sigma_emp, q_uncert_med)
 
                 quiet_records.append({
                     'Satellite': sat.upper(),
                     'Sensor': sensor,
                     'Channel': ch,
-                    'YearMonth': period,  # Already formatted as '2024-05'
+                    'YearMonth': period,
                     'QuietMedian': q_median,
-                    'QuietSigma': 0.0 if pd.isna(q_sigma) else q_sigma
+                    'QuietSigma': q_sigma,
+                    'QuietUncertMedian': q_uncert_med
                 })
 
 df_quiet_stats = pd.DataFrame(quiet_records)

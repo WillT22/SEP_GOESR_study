@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from scipy.optimize import curve_fit
+from scipy.stats import chi2
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
@@ -84,40 +85,62 @@ def band(E, log10_j0, gamma_a, delta_gamma, E0):
     """Returns linear Flux for the Band function."""
     return 10.0 ** band_log10(E, log10_j0, gamma_a, delta_gamma, E0)
 
-#%% Fit the spectra for each event
-# --- Helpers: Compute AICc and BIC from log10 residuals ---
-def compute_bic(residuals, k):
+#%% Fit the spectra for each event (Weighted Chi-Squared GOF + Scale-Invariant AICc/BIC)
+# --- Configuration ---
+APPLY_UNCERT_FLOOR = False  # Set True to enforce a minimum fractional uncertainty (e.g., for P2A/P5)
+UNCERT_FLOOR_FRAC = 0.10    # 10% floor when APPLY_UNCERT_FLOOR is True
+
+# --- Helpers: Chi-Squared GOF & Scale-Invariant Weighted BIC/AICc ---
+def compute_chi2_gof(residuals, sigma, k):
+    """Returns (chi2_val, chi2_red, p_value) for weighted residuals."""
     n = len(residuals)
-    rss = np.sum(residuals ** 2)
-    if rss <= 0 or n <= k:
+    dof = n - k
+    if dof <= 0 or np.any(sigma <= 0):
+        return np.nan, np.nan, np.nan
+    chi2_val = np.sum((residuals / sigma) ** 2)
+    chi2_red = chi2_val / dof
+    p_val = chi2.sf(chi2_val, dof)
+    return chi2_val, chi2_red, p_val
+
+def compute_bic_scale_invariant(chi2_val, n, k):
+    """Scale-invariant weighted BIC: n*ln(chi2/n) + k*ln(n)."""
+    if pd.isna(chi2_val) or chi2_val <= 0 or n <= k:
         return np.nan
-    return n * np.log(rss / n) + k * np.log(n)
-def compute_aicc(residuals, k):
-    n = len(residuals)
-    rss = np.sum(residuals ** 2)
-    if rss <= 0 or n <= k + 1:
+    return n * np.log(chi2_val / n) + k * np.log(n)
+
+def compute_aicc_scale_invariant(chi2_val, n, k):
+    """Scale-invariant weighted AICc: n*ln(chi2/n) + 2k + 2k(k+1)/(n-k-1)."""
+    if pd.isna(chi2_val) or chi2_val <= 0 or n <= k + 1:
         return np.nan
-    aic = n * np.log(rss / n) + 2 * k
+    aic = n * np.log(chi2_val / n) + 2 * k
     return aic + (2 * k * (k + 1)) / (n - k - 1)
+
 
 # --- Batch Fitting Loop ---
 fit_records = []
 
-# Loop over every unique (Event, Satellite, Orientation) combination
 for (event_name, sat, orientation), df_group in df_event_peaks.groupby(['Event', 'Satellite', 'Orientation']):
     
     # Exclude background channels so flat noise floors don't skew the high-energy tail
     df_real = df_group[~df_group['IsBackground'].fillna(False)].sort_values('EffectiveEnergy')
     
-    # Fit both Onset and Absolute peak spectra
-    for peak_type in ['OnsetFlux', 'TotalMaxFlux']:
+    # Fit both Onset and Absolute peak spectra with their matching uncertainty columns
+    for peak_type, uncert_col in [('OnsetFlux', 'OnsetUncert'), ('TotalMaxFlux', 'TotalMaxUncert')]:
         
-        df_valid = df_real.dropna(subset=['EffectiveEnergy', peak_type])
-        df_valid = df_valid[(df_valid['EffectiveEnergy'] > 0) & (df_valid[peak_type] > 0)]
+        df_valid = df_real.dropna(subset=['EffectiveEnergy', peak_type, uncert_col])
+        df_valid = df_valid[
+            (df_valid['EffectiveEnergy'] > 0) &
+            (df_valid[peak_type] > 0) &
+            (df_valid[uncert_col] > 0)
+        ]
         
         E = df_valid['EffectiveEnergy'].to_numpy(dtype=float)
         flux = df_valid[peak_type].to_numpy(dtype=float)
+        uncert = df_valid[uncert_col].to_numpy(dtype=float)
         n_pts = len(E)
+        
+        if APPLY_UNCERT_FLOOR:
+            uncert = np.maximum(uncert, UNCERT_FLOOR_FRAC * flux)
         
         # Base row with NaNs for failed/skipped fits
         row = {
@@ -128,11 +151,13 @@ for (event_name, sat, orientation), df_group in df_event_peaks.groupby(['Event',
             'N_Points': n_pts,
             # Ellison & Ramaty (k=3)
             'ER_log10_j0': np.nan, 'ER_gamma': np.nan, 'ER_E0': np.nan,
-            'ER_rmse': np.nan, 'ER_bic': np.nan, 'ER_aicc': np.nan,
+            'ER_rmse': np.nan, 'ER_chi2': np.nan, 'ER_chi2_red': np.nan, 'ER_pval': np.nan,
+            'ER_bic': np.nan, 'ER_aicc': np.nan,
             # Band (k=4)
             'Band_log10_j0': np.nan, 'Band_gamma_a': np.nan, 'Band_gamma_b': np.nan,
             'Band_E0': np.nan, 'Band_E_break': np.nan,
-            'Band_rmse': np.nan, 'Band_bic': np.nan, 'Band_aicc': np.nan,
+            'Band_rmse': np.nan, 'Band_chi2': np.nan, 'Band_chi2_red': np.nan, 'Band_pval': np.nan,
+            'Band_bic': np.nan, 'Band_aicc': np.nan,
             # Model comparison
             'BestModel_BIC': None, 'BestModel_AICc': None
         }
@@ -142,34 +167,45 @@ for (event_name, sat, orientation), df_group in df_event_peaks.groupby(['Event',
             continue
             
         log_flux = np.log10(flux)
+        sigma_log = uncert / (flux * np.log(10.0))
+        er_success = False
+        band_success = False
         
-        # 1. Fit Ellison & Ramaty (3 parameters -> needs >= 4 points)
+        # 1. Fit Ellison & Ramaty (k=3 -> needs >= 4 points)
         try:
             p0_er = [log_flux[0], 2.0, 30.0]
             bounds_er = ([-10.0, 0.0, 0.5], [15.0, 10.0, 2000.0])
             popt_er, _ = curve_fit(
                 ellison_ramaty_log10, E, log_flux,
+                sigma=sigma_log, absolute_sigma=True,
                 p0=p0_er, bounds=bounds_er, maxfev=10000
             )
             resid_er = log_flux - ellison_ramaty_log10(E, *popt_er)
+            er_chi2, er_chi2_red, er_pval = compute_chi2_gof(resid_er, sigma_log, k=3)
             
             row['ER_log10_j0'], row['ER_gamma'], row['ER_E0'] = popt_er
             row['ER_rmse'] = np.sqrt(np.mean(resid_er ** 2))
-            row['ER_bic'] = compute_bic(resid_er, k=3)
-            row['ER_aicc'] = compute_aicc(resid_er, k=3)
+            row['ER_chi2'] = er_chi2
+            row['ER_chi2_red'] = er_chi2_red
+            row['ER_pval'] = er_pval
+            row['ER_bic'] = compute_bic_scale_invariant(er_chi2, n_pts, k=3)
+            row['ER_aicc'] = compute_aicc_scale_invariant(er_chi2, n_pts, k=3)
+            er_success = True
         except RuntimeError:
             pass
             
-        # 2. Fit Band (4 parameters -> needs >= 5 points)
+        # 2. Fit Band (k=4 -> needs >= 5 points)
         if n_pts >= 5:
             try:
                 p0_band = [log_flux[0], 1.5, 2.0, 30.0]
                 bounds_band = ([-10.0, 0.0, 0.05, 0.5], [15.0, 8.0, 12.0, 2000.0])
                 popt_b, _ = curve_fit(
                     band_log10, E, log_flux,
+                    sigma=sigma_log, absolute_sigma=True,
                     p0=p0_band, bounds=bounds_band, maxfev=20000
                 )
                 resid_b = log_flux - band_log10(E, *popt_b)
+                band_chi2, band_chi2_red, band_pval = compute_chi2_gof(resid_b, sigma_log, k=4)
                 log10_j0, gamma_a, delta_gamma, E0 = popt_b
                 
                 row['Band_log10_j0'] = log10_j0
@@ -178,28 +214,31 @@ for (event_name, sat, orientation), df_group in df_event_peaks.groupby(['Event',
                 row['Band_E0'] = E0
                 row['Band_E_break'] = delta_gamma * E0
                 row['Band_rmse'] = np.sqrt(np.mean(resid_b ** 2))
-                row['Band_bic'] = compute_bic(resid_b, k=4)
-                row['Band_aicc'] = compute_aicc(resid_b, k=4)
+                row['Band_chi2'] = band_chi2
+                row['Band_chi2_red'] = band_chi2_red
+                row['Band_pval'] = band_pval
+                row['Band_bic'] = compute_bic_scale_invariant(band_chi2, n_pts, k=4)
+                row['Band_aicc'] = compute_aicc_scale_invariant(band_chi2, n_pts, k=4)
+                band_success = True
             except RuntimeError:
                 pass
         
-        # 3. Select the best model 
-        # Pick Best Model by lower BIC
+        # 3. Select Best Model by lower BIC
         er_bic, band_bic = row['ER_bic'], row['Band_bic']
         if pd.notna(er_bic) and pd.notna(band_bic):
             row['BestModel_BIC'] = 'Band' if band_bic < er_bic else 'EllisonRamaty'
-        elif pd.notna(er_bic):
+        elif er_success:
             row['BestModel_BIC'] = 'EllisonRamaty'
-        elif pd.notna(band_bic):
+        elif band_success:
             row['BestModel_BIC'] = 'Band'
 
-        # Pick Best Model by lower AICc
+        # 4. Select Best Model by lower AICc (falls back to ER for n=4–5 when AICc is undefined)
         er_aicc, band_aicc = row['ER_aicc'], row['Band_aicc']
-        if pd.notna(er_bic) and pd.notna(band_bic):
+        if pd.notna(er_aicc) and pd.notna(band_aicc):
             row['BestModel_AICc'] = 'Band' if band_aicc < er_aicc else 'EllisonRamaty'
-        elif pd.notna(er_aicc):
+        elif er_success:
             row['BestModel_AICc'] = 'EllisonRamaty'
-        elif pd.notna(band_aicc):
+        elif band_success:
             row['BestModel_AICc'] = 'Band'
             
         fit_records.append(row)
@@ -211,9 +250,13 @@ output_dir = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
 df_fits.to_parquet(output_dir / "SEP_spectral_fits.parquet", index=False)
 df_fits.to_csv(output_dir / "SEP_spectral_fits.csv", index=False)
 
-print(f"Completed fits for {len(df_fits)} spectra.")
-print(df_fits['BestModel_BIC'].value_counts(dropna=False).values)
-print(df_fits['BestModel_AICc'].value_counts(dropna=False).values)
+print(f"Completed fits for {len(df_fits)} spectra (Uncert floor={APPLY_UNCERT_FLOOR}).")
+print("\n--- Best Model Counts ---")
+print(df_fits['BestModel_BIC'].value_counts(dropna=False))
+print(df_fits['BestModel_AICc'].value_counts(dropna=False))
+print("\n--- Median Reduced Chi-Squared ---")
+print(f"ER median chi2_red:   {df_fits['ER_chi2_red'].median():.3f} (p >= 0.05: {(df_fits['ER_pval'].dropna() >= 0.05).mean():.1%})")
+print(f"Band median chi2_red: {df_fits['Band_chi2_red'].median():.3f} (p >= 0.05: {(df_fits['Band_pval'].dropna() >= 0.05).mean():.1%})")
 
 #%% Plot ER and Band fit parameter histograms (East vs. West)
 hist_dir = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\Fit_Parameter_Histograms")
@@ -469,3 +512,41 @@ for event_name, df_event in df_event_peaks.groupby('Event'):
 print(f"\n{'-'*50}")
 print("ALL SPECTRA PLOTS GENERATED AND SAVED SAFELY.")
 print(f"{'-'*50}")
+
+#%% Perform an Anderson-Darling test to test for Gaussian distribution
+from scipy.stats import anderson
+
+df_sub = df_fits[df_fits['PeakType'] == 'TotalMaxFlux'].copy()
+
+# 1. Check for optimizer boundary pile-up
+print("--- Boundary Pile-Up Check (TotalMaxFlux) ---")
+print(f"ER_E0 >= 1990 MeV:       {(df_sub['ER_E0'] >= 1990).sum()} / {df_sub['ER_E0'].notna().sum()}")
+print(f"ER_gamma <= 0.01:        {(df_sub['ER_gamma'] <= 0.01).sum()} / {df_sub['ER_gamma'].notna().sum()}")
+print(f"Band_E0 >= 1990 MeV:     {(df_sub['Band_E0'] >= 1990).sum()} / {df_sub['Band_E0'].notna().sum()}")
+dg = df_sub['Band_gamma_b'] - df_sub['Band_gamma_a']
+print(f"Band delta_gamma <= 0.06:{(dg <= 0.06).sum()} / {dg.notna().sum()}")
+print(f"Band delta_gamma >= 11.9:{(dg >= 11.9).sum()} / {dg.notna().sum()}")
+
+# 2. Deduplicate to 1 representative entry per physical Event (median across sat/orientation)
+df_ev = df_sub.groupby('Event', as_index=False)[
+    ['ER_log10_j0', 'ER_gamma', 'ER_E0', 'Band_log10_j0', 'Band_gamma_a', 'Band_gamma_b', 'Band_E0']
+].median()
+
+params = {
+    'ER_log10_j0':   df_ev['ER_log10_j0'].dropna(),
+    'ER_gamma':      df_ev['ER_gamma'].dropna(),
+    'ER_log10_E0':   np.log10(df_ev['ER_E0'].dropna()),
+    'Band_log10_j0': df_ev['Band_log10_j0'].dropna(),
+    'Band_gamma_a':  df_ev['Band_gamma_a'].dropna(),
+    'Band_gamma_b':  df_ev['Band_gamma_b'].dropna(),
+    'Band_log10_E0': np.log10(df_ev['Band_E0'].dropna()),
+}
+
+print(f"\n--- Event-Level AD Test (n={len(df_ev)} unique events) ---")
+print(f"{'Parameter':<15} | {'AD Stat':>8} | {'p-value':>8} | {'Normal (p>=0.05)?'}")
+print("-" * 55)
+for name, vals in params.items():
+    res = anderson(vals, dist='norm', method='interpolate')
+    status = "Pass" if res.pvalue >= 0.05 else "Fail"
+    print(f"{name:<15} | {res.statistic:8.2f} | {res.pvalue:8.4f} | {status}")
+
