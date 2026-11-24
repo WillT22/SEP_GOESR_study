@@ -277,7 +277,7 @@ def plot_goes_flux(goes_data, sat_name, sensor, start_date=None, end_date=None,
         
         # axvspan creates a shaded rectangle between two x-values
         # alpha=0.3 makes it transparent so the grid and data lines still show through
-        ax.axvspan(dt_start, dt_end, color='lightgray', alpha=0.3, label='Event Duration')
+        ax.axvspan(dt_start, dt_end, color='lightgray', alpha=0.5, label='Event Duration')
 
     # --- 6. Formatting & Legends ---
     min_date = df_flux_plot.index.min().strftime('%Y-%m-%d')
@@ -336,7 +336,10 @@ if PLOT_FULL:
                         clean_yaw=False)
 
 
-#%% Extract moving noise threshold for each channel by month
+#%% Extract purely data-driven monthly quiet-time stats via quiet-day selection
+HALF_WINDOW_MONTHS = 3   # ±3 months (7-month centered window)
+QUIET_DAY_FRAC = 0.20    # Use the quietest 20% of days in each window
+
 quiet_records = []
 
 for sat in goes_data.keys():
@@ -344,20 +347,16 @@ for sat in goes_data.keys():
         for ch in SGPS_CHANNELS:
             if ch not in goes_data[sat][sensor]:
                 continue
-                
+
             df_ch = goes_data[sat][sensor][ch]
-            flux = df_ch['AvgDiffProtonFlux'].replace(0, np.nan).dropna()
-            flux = flux[flux > 0.0]
-            
-            # Keep flux and uncertainty aligned
             uncert_col = 'AvgDiffProtonFluxUncert'
             cols = ['AvgDiffProtonFlux', uncert_col] if uncert_col in df_ch.columns else ['AvgDiffProtonFlux']
-            df_sub = df_ch[cols].copy()
-            df_sub['AvgDiffProtonFlux'] = df_sub['AvgDiffProtonFlux'].replace(0, np.nan)
-            df_sub = df_sub.dropna(subset=['AvgDiffProtonFlux'])
-            df_sub = df_sub[df_sub['AvgDiffProtonFlux'] > 0.0]
 
-            # Optional: exclude maneuvering (yaw_flip_flag == 1) if present
+            # Keep zeros intact for quiet-day ranking; only drop NaNs and negative fill values
+            df_sub = df_ch[cols].dropna(subset=['AvgDiffProtonFlux']).copy()
+            df_sub = df_sub[df_sub['AvgDiffProtonFlux'] >= 0.0]
+
+            # Exclude maneuvering (yaw_flip_flag == 1) if present
             if 'yaw_flip_flag' in df_ch.columns:
                 valid_yaw = df_ch['yaw_flip_flag'].isin([0, 2])
                 df_sub = df_sub[valid_yaw.reindex(df_sub.index, fill_value=False)]
@@ -365,19 +364,44 @@ for sat in goes_data.keys():
             if df_sub.empty:
                 continue
 
-            ch_threshold = CHANNEL_THRESHOLDS.get(ch, 1e-3)
+            # Rank each day by its 75th percentile flux (including zeros)
+            daily_p75 = df_sub['AvgDiffProtonFlux'].resample('1D').quantile(0.75).dropna()
+            if daily_p75.empty:
+                continue
 
-            for period, group in df_sub.groupby(df_sub.index.strftime('%Y-%m')):
-                quiet = group[group['AvgDiffProtonFlux'] <= ch_threshold]
-                
+            # Drop timezone before converting to PeriodIndex to silence UserWarning
+            idx_naive = df_sub.index.tz_localize(None) if df_sub.index.tz is not None else df_sub.index
+            months = sorted(idx_naive.to_period('M').unique())
+            tz = df_sub.index.tz
+
+            for m in months:
+                t_start = (m - HALF_WINDOW_MONTHS).start_time
+                t_end = (m + HALF_WINDOW_MONTHS).end_time
+                if tz is not None:
+                    t_start = t_start.tz_localize(tz)
+                    t_end = t_end.tz_localize(tz)
+
+                # Select the quietest 20% of days in the centered window
+                win_days = daily_p75.loc[t_start:t_end]
+                if len(win_days) < 15:
+                    continue
+
+                n_quiet_days = max(5, int(len(win_days) * QUIET_DAY_FRAC))
+                quiet_dates = set(win_days.nsmallest(n_quiet_days).index.date)
+
+                # Extract 5-min bins from those quiet days, then drop zeros for flux stats
+                win_data = df_sub.loc[t_start:t_end]
+                quiet = win_data[np.isin(win_data.index.date, list(quiet_dates))]
+                quiet = quiet[quiet['AvgDiffProtonFlux'] > 0.0]
+
                 if len(quiet) < 20:
-                    quiet = group[group['AvgDiffProtonFlux'] <= group['AvgDiffProtonFlux'].quantile(0.25)]
-                
-                if len(quiet) < 5:
                     continue
 
                 q_flux = quiet['AvgDiffProtonFlux']
                 q_median = q_flux.median()
+                q_p95 = q_flux.quantile(0.95)
+                q_p99 = q_flux.quantile(0.99)
+
                 mad = (q_flux - q_median).abs().median()
                 q_sigma_emp = 1.4826 * mad if mad > 0 else q_flux.std()
                 q_sigma_emp = 0.0 if pd.isna(q_sigma_emp) else q_sigma_emp
@@ -395,8 +419,11 @@ for sat in goes_data.keys():
                     'Satellite': sat.upper(),
                     'Sensor': sensor,
                     'Channel': ch,
-                    'YearMonth': period,
+                    'YearMonth': str(m),
+                    'QuietCount': len(quiet),
                     'QuietMedian': q_median,
+                    'QuietP95': q_p95,
+                    'QuietP99': q_p99,
                     'QuietSigma': q_sigma,
                     'QuietUncertMedian': q_uncert_med
                 })

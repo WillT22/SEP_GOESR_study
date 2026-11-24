@@ -21,6 +21,8 @@ plt.rcParams.update({
     'legend.markerscale': 1.0
 })
 
+BASE_DIR = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
+
 SGPS_CHANNELS = ['P1', 'P2A', 'P2B', 'P3', 'P4', 'P5', 'P6', 'P7', 'P8A', 'P8B', 'P8C', 'P9', 'P10']
 CHANNEL_TO_NUM = {ch: i for i, ch in enumerate(SGPS_CHANNELS)}
 CHANNEL_THRESHOLDS = {
@@ -28,6 +30,11 @@ CHANNEL_THRESHOLDS = {
     'P3': 1e-2, 'P4': 1e-2, 'P5': 1e-2,
     'P6': 1e-3, 'P7': 1e-3, 'P8A': 1e-3,
     'P8B': 1e-3, 'P8C': 1e-3, 'P9': 1e-3, 'P10': 1e-3
+}
+
+# Exclude known truncated/corrupted satellite records
+EXCLUDED_EVENT_SATS = {
+    ('Event_20230313_0735', 'goes17'),
 }
 
 
@@ -42,10 +49,11 @@ sep_catalog['Event_Folder'] = 'Event_' + sep_catalog['Begin_Time_UTC'].dt.strfti
 
 
 # Import quiet lookup data
-df_quiet = pd.read_csv(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\quiet_background_stats.csv")
+df_quiet_stats = pd.read_csv(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data\quiet_background_stats.csv")
 quiet_lookup = {
-    (row.Satellite, row.Sensor, row.Channel, row.YearMonth): (row.QuietMedian, row.QuietSigma)
-    for row in df_quiet.itertuples(index=False)
+    (row.Satellite, row.Sensor, row.Channel, row.YearMonth): (
+        row.QuietMedian, row.QuietSigma, row.QuietP99,)
+    for row in df_quiet_stats.itertuples(index=False)
 }
 
 
@@ -60,11 +68,16 @@ loaded_events = defaultdict(lambda: defaultdict(dict))
 print(f"Scanning for event data in: {data_input_base}")
 
 # 3. Iterate through all 'Event_' folders
+# Set to a list of event names to test, or None to load all events
+TARGET_EVENTS = None#['Event_20210529_0300','Event_20220328_1325','Event_20230313_0735','Event_20230716_0635']  # <-- replace with your target folder name
+
 for event_dir in data_input_base.glob("Event_*"):
     if not event_dir.is_dir():
         continue
-        
-    event_name = event_dir.name  # e.g., "Event_20230501_1430"
+
+    event_name = event_dir.name
+    if TARGET_EVENTS is not None and event_name not in TARGET_EVENTS:
+        continue
     
     # 4. Iterate through all Parquet files inside this specific event's folder
     for pq_file in event_dir.glob("*_event_data.parquet"):
@@ -73,6 +86,9 @@ for event_dir in data_input_base.glob("Event_*"):
         # Example filename: "goes16_sensor0_event_data.parquet"
         parts = pq_file.stem.split('_')
         sat_name = parts[0]
+
+        if (event_name, sat_name.lower()) in EXCLUDED_EVENT_SATS:
+            continue
         
         # Safely extract the integer sensor number
         try:
@@ -89,164 +105,270 @@ for event_dir in data_input_base.glob("Event_*"):
 
 print(f"Successfully loaded {len(loaded_events)} events into memory.")
 
+#%% Determine the maximum flux for each channel as a function of effective energy
+PRE_EVENT_WINDOW = pd.Timedelta(hours=3)     # Pre-event slice length before Begin_Time_UTC
+ONSET_PRE_BUFFER = pd.Timedelta(minutes=10)  # Ignore pre-event bumps earlier than Begin_Time - 10 min
 
-#%% Determine the maximum flux for each channel as a function of the effective energy for a given sensor
-# Before begin time difference
-time_difference = pd.Timedelta(hours=3)
+# Consolidated noise-rejection & onset-detection parameters
+DEFAULT_CFG = {
+    'n_sigma':         3.0,      # Sigma above quiet background
+    'min_bg_factor':   1.5,      # Minimum multiplicative rise above baseline
+    'min_points':      4,        # Consecutive smoothed bins above threshold (20 min)
+    'smooth_window':   9,        # Centered rolling median window (45 min)
+    'slope_step':      6,        # Slow slope baseline in bins (30 min)
+    'fast_slope_step': 2,        # Fast slope baseline in bins (10 min)
+    'rise_slope':      0.10,     # dex/hr: minimum prompt rise steepness
+    'plateau_slope':   0.05,     # dex/hr: slope tolerance for flat turnover
+    'min_rise_dex':    0.30,     # Minimum net rise (0.30 dex ≈ 2x)
+    'min_distance':    3,        # Ignore knees within N bins of total_max_time (15 min)
+    'confirm_bins':    48,       # Forward check window to reject mid-ramp stutters (4 hr)
+    'stutter_tol_dex': 0.20,     # Max allowed climb within confirm_bins to confirm turnover
+    'knee_selection':  'first',  # 'first' or 'last_before_max'
+}
 
-# --- Tunable Noise-Rejection Parameters ---
-N_SIGMA = 3.0               # Peak must be at least 3-sigma above pre-event background
-MIN_RATIO = 2.0             # Peak must be at least 2x the background median
-MIN_POINTS_ABOVE_BG = 3     # Minimum points above (bg + 3*sigma) to reject single-point spikes
+CHANNEL_OVERRIDES = {
+    'P1':  {'smooth_window': 15, 'slope_step': 12},
+    'P10': {'min_points': 2},
+}
 
+
+def get_orientation(df_event, sensor):
+    """Determine dominant East/West viewing orientation from yaw_flip_flag."""
+    state = 0
+    if 'yaw_flip_flag' in df_event.columns:
+        valid = df_event['yaw_flip_flag'][df_event['yaw_flip_flag'].isin([0, 2])]
+        if not valid.empty:
+            state = valid.mode().iloc[0]
+
+    if state == 0:
+        return 'West' if sensor == 0 else 'East'
+    return 'East' if sensor == 0 else 'West'
+
+
+def snap_local_max(series, idx, pad=1):
+    """Return (timestamp, flux) of the raw maximum within ±pad bins of a smoothed index."""
+    local = series.iloc[max(0, idx - pad):min(len(series), idx + pad + 1)]
+    return local.idxmax(), local.max()
+
+
+def extract_onset_peak(flux_series, log_smooth, log_thresh, onset_earliest,
+                       total_max_time, total_max_flux, cfg):
+    """Detect turnover knees using log_smooth for plateaus and a 3-bin fast_log for sharp peaks."""
+    initial_flux = flux_series.iloc[0]
+    search_flux = flux_series.loc[onset_earliest:total_max_time]
+    search_log = log_smooth.loc[onset_earliest:total_max_time]
+
+    if len(search_flux) < 3:
+        return total_max_time, total_max_flux, 'total_max'
+
+    slow_step = cfg['slope_step']
+    fast_step = cfg['fast_slope_step']
+    rise_slope = cfg['rise_slope']
+    plateau_slope = cfg['plateau_slope']
+    min_rise_dex = cfg['min_rise_dex']
+    min_gap_bins = cfg['min_distance']
+    confirm_bins = cfg['confirm_bins']
+    stutter_tol_dex = cfg['stutter_tol_dex']
+
+    # Lightly smoothed log flux (3-bin median) preserves narrow 10-15 min peaks
+    raw_log = np.log10(search_flux.replace(0, np.nan))
+    fast_log = (
+        raw_log.rolling(3, center=True, min_periods=1).median()
+        .interpolate().bfill().ffill()
+    )
+
+    # Dual-scale slopes (dex/hr)
+    t_series = search_flux.index.to_series()
+    dt_slow = t_series.diff(slow_step).dt.total_seconds() / 3600.0
+    dt_fast = t_series.diff(fast_step).dt.total_seconds() / 3600.0
+
+    slope_slow = (search_log.diff(slow_step) / dt_slow.replace(0, np.nan)).fillna(0.0).values
+    slope_fast = (fast_log.diff(fast_step) / dt_fast.replace(0, np.nan)).fillna(0.0).values
+    slope_rise = np.maximum(slope_slow, slope_fast)
+
+    vals = search_log.values
+    fast_vals = fast_log.values
+    n = len(vals)
+    max_log = np.log10(total_max_flux)
+
+    # Scan forward for every "rise -> turnover" knee
+    knees = []
+    in_rise = False
+    rise_start_val = min(vals[0], fast_vals[0])
+
+    for i in range(n):
+        if not in_rise:
+            if slope_rise[i] >= rise_slope:
+                in_rise = True
+                rise_start_val = min(
+                    vals[max(0, i - slow_step):i + 1].min(),
+                    fast_vals[max(0, i - fast_step):i + 1].min(),
+                )
+        else:
+            is_flat_turnover = slope_slow[i] <= plateau_slope
+            is_sharp_apex = (
+                0 < i < n - 1 and
+                fast_vals[i] >= fast_vals[i - 1] and
+                fast_vals[i] > fast_vals[i + 1]
+            )
+
+            if is_flat_turnover or is_sharp_apex:
+                peak_val = fast_vals[i] if is_sharp_apex else vals[i]
+
+                # Reject mid-ramp stutters if smoothed flux climbs significantly within confirm_bins
+                fwd_end = min(n, i + confirm_bins + 1)
+                if fwd_end > i + 1 and vals[i + 1:fwd_end].max() > (peak_val + stutter_tol_dex):
+                    continue
+
+                net_gain = peak_val - rise_start_val
+                if peak_val >= log_thresh and net_gain >= min_rise_dex:
+                    is_far_below_max = (max_log - peak_val) > 1.0
+                    short_window_min = fast_vals[i:min(n, i + 24)].min()
+                    returns_to_baseline = short_window_min <= (rise_start_val + 0.15)
+
+                    if not (is_far_below_max and returns_to_baseline):
+                        knees.append(i)
+
+                in_rise = False
+
+    valid_knees = [k for k in knees if k < (n - min_gap_bins)]
+    if not valid_knees:
+        if total_max_flux <= 1.2 * initial_flux:
+            return flux_series.index[0], initial_flux, 'initial_flux'
+        return total_max_time, total_max_flux, 'total_max'
+
+    chosen_idx = valid_knees[0] if cfg['knee_selection'] == 'first' else valid_knees[-1]
+    onset_time, onset_flux = snap_local_max(search_flux, chosen_idx, pad=2)
+
+    lookahead = min(n, chosen_idx + 12)
+    future_min = fast_vals[chosen_idx:lookahead].min()
+    method = 'log_peak' if (fast_vals[chosen_idx] - future_min) >= 0.15 else 'plateau'
+
+    return onset_time, onset_flux, method
+
+
+# --- Main Processing Loop ---
 summary_data = []
 
-# Iterate through every event loaded into memory
-for event_name, satellites in loaded_events.items(): 
-    
-    # Look up the matching event row in the catalog
+for event_name, satellites in loaded_events.items():
     event_match = sep_catalog[sep_catalog['Event_Folder'] == event_name]
     if event_match.empty:
         print(f"Warning: {event_name} not found in sep_catalog. Skipping.")
         continue
+
     event_row = event_match.iloc[0]
-    
-    # Universal start of the search window: Begin_Time_UTC - 6 hours
-    slice_start = event_row['Begin_Time_UTC'] - time_difference
-    
+    begin_time = event_row['Begin_Time_UTC']
+    slice_start = begin_time - PRE_EVENT_WINDOW
+    onset_earliest = begin_time - ONSET_PRE_BUFFER
+    event_ym = begin_time.strftime('%Y-%m')
+
     for sat_name, sensors in satellites.items():
+        sat_upper = sat_name.upper()
         for sensor, df_event in sensors.items():
-            
-            # --- Determine the dominant physical orientation for this event ---
-            state = 0  # Default to upright
-            if 'yaw_flip_flag' in df_event.columns:
-                physical_states = df_event['yaw_flip_flag'][df_event['yaw_flip_flag'].isin([0, 2])]
-                if not physical_states.empty:
-                    state = physical_states.mode().iloc[0]
-            
-            if state == 0:
-                orientation = 'West' if sensor == 0 else 'East'
-            else:  # state == 2 (Inverted)
-                orientation = 'East' if sensor == 0 else 'West'
-            
-            # Loop through all possible SGPS channels
+            orientation = get_orientation(df_event, sensor)
+
             for ch in SGPS_CHANNELS:
                 flux_col = f'{ch}_Flux'
-                if flux_col not in df_event.columns:
+                slice_end_raw = event_row.get(f'{ch}_End_Time', pd.NaT)
+                if flux_col not in df_event.columns or pd.isna(slice_end_raw):
                     continue
-                
-                # Pull this channel's specific end time from the catalog
-                end_col = f'{ch}_End_Time'
-                slice_end_raw = event_row.get(end_col, pd.NaT)
-                if pd.isna(slice_end_raw):
-                    continue
-                    
+
                 slice_end = pd.to_datetime(slice_end_raw)
                 if slice_end.tzinfo is None:
                     slice_end = slice_end.tz_localize('UTC')
 
-                # Slice the buffered Parquet data to [Begin_Time_UTC - 6h, ch_End_Time]
                 df_window = df_event.loc[slice_start:slice_end]
                 flux_series = df_window[flux_col].replace(0, np.nan).dropna()
                 flux_series = flux_series[flux_series > 0.0]
-                
                 if flux_series.empty:
                     continue
 
-                # --- 1. Estimate Background Noise Level ---
-                # Use the pre-event buffer (-24h to -6h); fall back to the event window if empty
-                bg_series = df_event.loc[:slice_start, flux_col].replace(0, np.nan).dropna()
-                bg_series = bg_series[bg_series > 0.0]
-                if len(bg_series) < 2:
-                    bg_series = flux_series
+                cfg = {**DEFAULT_CFG, **CHANNEL_OVERRIDES.get(ch, {})}
 
-                bg_median = bg_series.median()
-                # Robust sigma via MAD; fall back to std() if quantized counts make MAD == 0
-                mad = (bg_series - bg_median).abs().median()
-                bg_sigma = 1.4826 * mad if mad > 0 else bg_series.std()
-                if pd.isna(bg_sigma):
-                    bg_sigma = 0.0
-
-                # --- 2. Test Whether a Discernible Peak Exists ---
+                # 1. Background threshold & real-peak detection
                 total_max_time = flux_series.idxmax()
                 total_max_flux = flux_series.max()
-                event_ym = event_row['Begin_Time_UTC'].strftime('%Y-%m')
                 ch_threshold = CHANNEL_THRESHOLDS.get(ch, 1e-3)
 
-                q_median, q_sigma = quiet_lookup.get(
-                    (sat_name.upper(), sensor, ch, event_ym),
-                    (ch_threshold, 0.0)
+                q_median, q_sigma, q_p99 = quiet_lookup.get(
+                    (sat_upper, sensor, ch, event_ym), (np.nan, 0.0, np.nan)
+                )
+                baseline = q_median if pd.notna(q_median) and q_median > 0 else ch_threshold
+                p99_floor = q_p99 if pd.notna(q_p99) and q_p99 > 0 else baseline
+
+                pre_event = flux_series.loc[:begin_time]
+                if len(pre_event) >= 3 and pre_event.median() < 2.0 * baseline:
+                    baseline = max(baseline, pre_event.median())
+
+                detect_thresh = max(
+                    p99_floor,
+                    baseline + cfg['n_sigma'] * q_sigma,
+                    baseline * cfg['min_bg_factor'],
                 )
 
-                # Use whichever baseline is higher: your physical threshold or that month's actual quiet median
-                baseline = max(ch_threshold, q_median)
-                has_real_peak = total_max_flux > (baseline + N_SIGMA * q_sigma)
+                log_smooth = np.log10(flux_series).rolling(
+                    window=cfg['smooth_window'], center=True, min_periods=1
+                ).median()
+                log_thresh = np.log10(detect_thresh)
 
-                energy_col = f'{ch}_Energy'
-                uncert_col = f'{ch}_Uncert'
+                has_consecutive = (
+                    (log_smooth > log_thresh)
+                    .rolling(window=cfg['min_points'])
+                    .sum()
+                    .ge(cfg['min_points'])
+                    .any()
+                )
+                has_real_peak = (total_max_flux > detect_thresh) and has_consecutive
 
+                energy_col, uncert_col = f'{ch}_Energy', f'{ch}_Uncert'
                 eff_energy = df_window.loc[total_max_time, energy_col] if energy_col in df_window.columns else np.nan
                 total_max_uncert = df_window.loc[total_max_time, uncert_col] if uncert_col in df_window.columns else np.nan
 
+                # 2. Extract onset peak or flag as background
                 if has_real_peak:
-                    # Calculate the Onset (Prompt) Peak
-                    peaks, _ = find_peaks(flux_series.values, prominence=total_max_flux * 0.1)
-                    
-                    if len(peaks) > 0:
-                        onset_idx = peaks[0]
-                        onset_time = flux_series.index[onset_idx]
-                        onset_flux = flux_series.iloc[onset_idx]
-                        onset_uncert = df_window.loc[onset_time, uncert_col] if uncert_col in df_window.columns else np.nan
-                    else:
-                        onset_time = total_max_time
-                        onset_flux = total_max_flux
-                        onset_uncert = total_max_uncert
-                    
+                    onset_time, onset_flux, onset_method = extract_onset_peak(
+                        flux_series, log_smooth, log_thresh, onset_earliest,
+                        total_max_time, total_max_flux, cfg
+                    )
+                    onset_uncert = df_window.loc[onset_time, uncert_col] if uncert_col in df_window.columns else np.nan
                     is_single_peak = (onset_time == total_max_time)
                     is_background = False
                 else:
-                    # No discernible peak: keep the raw max, but flag as background
-                    onset_flux = total_max_flux
-                    onset_time = total_max_time
-                    onset_uncert = total_max_uncert
-                    is_single_peak = True
-                    is_background = True
-                
+                    onset_time, onset_flux, onset_uncert = total_max_time, total_max_flux, total_max_uncert
+                    onset_method, is_single_peak, is_background = 'background', True, True
+
                 summary_data.append({
                     'Event': event_name,
-                    'Satellite': sat_name.upper(),
+                    'Satellite': sat_upper,
                     'Sensor': sensor,
                     'Orientation': orientation,
-                    'ChannelNum': CHANNEL_TO_NUM.get(ch, 99),  
-                    'Channel': ch,  
+                    'ChannelNum': CHANNEL_TO_NUM.get(ch, 99),
+                    'Channel': ch,
                     'EffectiveEnergy': eff_energy,
                     'OnsetFlux': onset_flux,
                     'OnsetUncert': onset_uncert,
                     'OnsetTime': onset_time,
+                    'OnsetMethod': onset_method,
                     'TotalMaxFlux': total_max_flux,
                     'TotalMaxUncert': total_max_uncert,
                     'TotalMaxTime': total_max_time,
                     'IsSinglePeak': is_single_peak,
-                    'IsBackground': is_background
+                    'IsBackground': is_background,
                 })
 
-# Convert the results to a clean DataFrame and sort chronologically and by channel
-df_event_peaks = pd.DataFrame(summary_data)
-df_event_peaks = df_event_peaks.sort_values(['Event', 'Satellite', 'Orientation', 'ChannelNum']).reset_index(drop=True)
+df_event_peaks = (
+    pd.DataFrame(summary_data)
+    .sort_values(['Event', 'Satellite', 'Orientation', 'ChannelNum'])
+    .reset_index(drop=True)
+)
 
-# --- Save Summary Data ---
-output_dir = Path(r"C:\Users\wzt0020\Box\SEP_Box\SGPS_data")
-output_dir.mkdir(parents=True, exist_ok=True)
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+df_event_peaks.to_parquet(BASE_DIR / "SEP_event_peaks_summary.parquet", index=False)
+df_event_peaks.to_csv(BASE_DIR / "SEP_event_peaks_summary.csv", index=False)
 
-# 1. Parquet (recommended for reloading into Python/pandas with exact dtypes & UTC timezones)
-parquet_path = output_dir / "SEP_event_peaks_summary.parquet"
-df_event_peaks.to_parquet(parquet_path, index=False)
-
-# 2. CSV (for quick visual inspection in Excel or sharing)
-csv_path = output_dir / "SEP_event_peaks_summary.csv"
-df_event_peaks.to_csv(csv_path, index=False)
-
-print(f"Saved {len(df_event_peaks)} rows to:\n  - {parquet_path}\n  - {csv_path}")
+print(f"Saved {len(df_event_peaks)} rows.")
+print("\n--- Onset Detection Method Breakdown ---")
+print(df_event_peaks['OnsetMethod'].value_counts())
 
 #%% Plot the peak flux for each event
 # --- Configuration & Folder Setup ---
@@ -336,14 +458,14 @@ for event_name, df_event in df_event_peaks.groupby('Event'):
                         yerr=log_safe_yerr(df_bg[peak_type], df_bg[uncert_col]),
                         color=color, linestyle='none', marker=marker, markersize=9,
                         markerfacecolor='lightgray', markeredgecolor=color, markeredgewidth=1.2,
-                        elinewidth=1.0, capsize=8, capthick=2, alpha=0.4, label=bg_label, zorder=3
+                        elinewidth=1.0, capsize=8, capthick=2, alpha=0.5, label=bg_label, zorder=3
                     )
                 else:
                     ax.plot(
                         df_bg['ChannelNum'], df_bg[peak_type],
                         color=color, linestyle='none', marker=marker, markersize=9,
                         markerfacecolor='lightgray', markeredgecolor=color, markeredgewidth=1.2,
-                        alpha=0.4, label=bg_label, zorder=3
+                        alpha=0.5, label=bg_label, zorder=3
                     )
 
         energy_labels = []
@@ -624,7 +746,7 @@ def plot_event_flux_with_peaks(df_event, sat_name, sensor, df_peaks, event_name,
             is_bg = bool(peak_row.get('IsBackground', False))
             
             # Styling based on whether the channel is a real peak or background
-            marker_alpha = 0.35 if is_bg else 1.0
+            marker_alpha = 0.6 if is_bg else 0.95
             edge_lw = 1.2 if is_bg else 1.5
             z_marker = 4 if is_bg else 6
             
@@ -638,8 +760,8 @@ def plot_event_flux_with_peaks(df_event, sat_name, sensor, df_peaks, event_name,
                            facecolors=color, edgecolors='black', linewidths=edge_lw, 
                            alpha=marker_alpha, zorder=z_marker)
 
-            # Onset Max Peak (only if distinct)
-            if not peak_row['IsSinglePeak']:
+            # Onset Max Peak (only if not background)
+            if not is_bg:
                 onset_time = peak_row['OnsetTime']
                 onset_flux = peak_row['OnsetFlux']
                 if pd.notna(onset_time) and (df_flux_plot.index.min() <= onset_time <= df_flux_plot.index.max()):
@@ -774,7 +896,7 @@ for event_name, satellites in loaded_events.items():
     if event_start.tzinfo is None: event_start = event_start.tz_localize('UTC')
     if event_end.tzinfo is None: event_end = event_end.tz_localize('UTC')
     
-    event_start_str = (event_start - time_difference).strftime('%Y-%m-%d %H:%M')
+    event_start_str = (event_start - PRE_EVENT_WINDOW).strftime('%Y-%m-%d %H:%M')
     event_end_str = event_end.strftime('%Y-%m-%d %H:%M')
     
     # Calculate visual bounds for the plot axis (buffered)
@@ -782,7 +904,7 @@ for event_name, satellites in loaded_events.items():
     plot_end = event_end + post_event_buffer
     
     # Shift plot start back by threshold to accommodate the onset window
-    plot_start_str = (plot_start - time_difference).strftime('%Y-%m-%d %H:%M')
+    plot_start_str = (plot_start - PRE_EVENT_WINDOW).strftime('%Y-%m-%d %H:%M')
     plot_end_str = plot_end.strftime('%Y-%m-%d %H:%M')
     
     event_save_dir = plot_output_base / event_name
