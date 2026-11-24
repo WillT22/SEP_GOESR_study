@@ -266,6 +266,8 @@ for event_name, satellites in loaded_events.items():
         sat_upper = sat_name.upper()
         for sensor, df_event in sensors.items():
             orientation = get_orientation(df_event, sensor)
+            seen_real_peak = False
+            tail_is_background = False
 
             for ch in SGPS_CHANNELS:
                 flux_col = f'{ch}_Flux'
@@ -319,6 +321,14 @@ for event_name, satellites in loaded_events.items():
                     .any()
                 )
                 has_real_peak = (total_max_flux > detect_thresh) and has_consecutive
+
+                # Flag high-energy bump-on-tail channels as background once a lower channel drops to background
+                if tail_is_background:
+                    has_real_peak = False
+                elif has_real_peak:
+                    seen_real_peak = True
+                elif seen_real_peak:
+                    tail_is_background = True
 
                 energy_col, uncert_col = f'{ch}_Energy', f'{ch}_Uncert'
                 eff_energy = df_window.loc[total_max_time, energy_col] if energy_col in df_window.columns else np.nan
