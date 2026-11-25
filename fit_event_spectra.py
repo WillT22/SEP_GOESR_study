@@ -116,9 +116,6 @@ def band(E, log10_j0, gamma_a, delta_gamma, E0):
 
 
 #%% Fit Absolute Max Spectra (Weighted Chi-Squared GOF + Scale-Invariant AICc/BIC)
-APPLY_UNCERT_FLOOR = False  # Set True to enforce a minimum fractional uncertainty
-UNCERT_FLOOR_FRAC = 0.10    # 10% floor when APPLY_UNCERT_FLOOR is True
-
 def compute_chi2_gof(residuals, sigma, k):
     """Returns (chi2_val, chi2_red, p_value) for weighted residuals."""
     n = len(residuals)
@@ -145,7 +142,7 @@ def compute_aicc_scale_invariant(chi2_val, n, k):
 
 
 # --- Mode Toggle ---
-GROUP_BY_ORIENTATION_ONLY = False  # True = 2 spectra/event (East & West pooled); False = per (Sat, Orientation)
+GROUP_BY_ORIENTATION_ONLY = True  # True = 2 spectra/event (East & West pooled); False = per (Sat, Orientation)
 mode_tag = "grouped_EW" if GROUP_BY_ORIENTATION_ONLY else "per_sensor"
 
 fit_records = []
@@ -178,9 +175,6 @@ for group_key, df_group in df_event_peaks.groupby(group_cols):
     flux = df_valid[peak_type].to_numpy(dtype=float)
     uncert = df_valid[uncert_col].to_numpy(dtype=float)
     n_pts = len(E)
-
-    if APPLY_UNCERT_FLOOR:
-        uncert = np.maximum(uncert, UNCERT_FLOOR_FRAC * flux)
 
     row = {
         'Event': event_name,
@@ -289,7 +283,7 @@ df_fits = pd.DataFrame(fit_records)
 df_fits.to_parquet(BASE_DIR / f"SEP_spectral_fits_{mode_tag}.parquet", index=False)
 df_fits.to_csv(BASE_DIR / f"SEP_spectral_fits_{mode_tag}.csv", index=False)
 
-print(f"Completed fits for {len(df_fits)} Absolute Max spectra (Uncert floor={APPLY_UNCERT_FLOOR}).")
+print(f"Completed fits for {len(df_fits)} Absolute Max spectra).")
 print("\n--- Best Model Counts ---")
 print(df_fits['BestModel_BIC'].value_counts(dropna=False))
 print(df_fits['BestModel_AICc'].value_counts(dropna=False))
@@ -301,7 +295,7 @@ print("\n--- Event Counts by S-Scale (unique events) ---")
 print(df_fits.drop_duplicates(subset='Event')['S_Scale'].value_counts())
 
 #%% Plot All Absolute Max Energy Spectra with Fits (Color = East/West, Shape = Satellite)
-PLOT_BOOL = True
+PLOT_BOOL = False
 if PLOT_BOOL:
     PLOT_BEST_FIT_ONLY = False  # Set True to only draw the AICc-winning fit
 
@@ -508,7 +502,7 @@ if PLOT_BOOL:
     print(f"{'-'*50}")
 
 #%% 1. Parameter Covariance & Correlation Matrices (Catalog-Level)
-corr_dir = BASE_DIR / "Correlation_Heatmaps"
+corr_dir = BASE_DIR / "Stat_Plots"
 corr_dir.mkdir(parents=True, exist_ok=True)
 
 LABEL_MAP = {
@@ -800,7 +794,7 @@ print(df_ew_stats.to_string(index=False, float_format=lambda x: f"{x:.4g}"))
 
 
 #%% Plot ER and Band Fit Parameter Histograms (Absolute Peak, East vs. West)
-hist_dir = BASE_DIR / "Fit_Parameter_Histograms"
+hist_dir = BASE_DIR / "Stat_Plots"
 hist_dir.mkdir(parents=True, exist_ok=True)
 
 orient_colors = {'East': '#1f77b4', 'West': '#ff7f0e'}
@@ -881,3 +875,524 @@ plot_param_histograms(
 
 print(f"Saved parameter histograms to {hist_dir}")
 
+#%% Separate storm times
+#%% Plot ER and Band Fit Parameter Histograms by NOAA S-Scale (Shared Global X-Axis)
+hist_dir = BASE_DIR / "Stat_Plots" / "By_S_Scale"
+hist_dir.mkdir(parents=True, exist_ok=True)
+
+orient_colors = {'East': '#1f77b4', 'West': '#ff7f0e'}
+
+er_params = [
+    ('ER_log10_j0', r'$\log_{10}(j_0)$', False),
+    ('ER_gamma',    r'$\gamma$',         False),
+    ('ER_E0',       r'$E_0$ (MeV)',      True),
+]
+
+band_params = [
+    ('Band_log10_j0', r'$\log_{10}(j_0)$',           False),
+    ('Band_gamma_a',  r'$\gamma_a$',                 False),
+    ('Band_gamma_b',  r'$\gamma_b$',                 False),
+    ('Band_E0',       r'$E_0$ (MeV)',                True),
+    ('Band_E_break',  r'$E_{\mathrm{break}}$ (MeV)', True),
+]
+
+
+def compute_global_bins(df_full, params, bins=20):
+    """Precompute shared bin edges for each parameter across the entire df_fits catalog."""
+    global_bins = {}
+    for col, _, is_log in params:
+        vals = df_full[col].dropna()
+        if is_log:
+            vals = vals[vals > 0]
+        if vals.empty:
+            continue
+
+        vmin, vmax = vals.min(), vals.max()
+        if is_log:
+            if vmin == vmax:
+                vmin, vmax = vmin * 0.8, vmax * 1.2
+            global_bins[col] = np.logspace(np.log10(vmin), np.log10(vmax), bins + 1)
+        else:
+            if vmin == vmax:
+                vmin, vmax = vmin - 0.5, vmax + 0.5
+            global_bins[col] = np.linspace(vmin, vmax, bins + 1)
+
+    return global_bins
+
+
+def plot_param_histograms(df_sub, params, model_name, save_path, title_suffix="", bins=20, global_bins=None):
+    n_params = len(params)
+    ncols = 3
+    nrows = int(np.ceil(n_params / ncols))
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4.5 * nrows))
+    axes = np.atleast_1d(axes).ravel()
+
+    for ax, (col, xlabel, is_log) in zip(axes, params):
+        vals_east = df_sub.loc[df_sub['Orientation'] == 'East', col].dropna()
+        vals_west = df_sub.loc[df_sub['Orientation'] == 'West', col].dropna()
+
+        if is_log:
+            vals_east = vals_east[vals_east > 0]
+            vals_west = vals_west[vals_west > 0]
+
+        combined = pd.concat([vals_east, vals_west])
+        if combined.empty:
+            ax.set_title(f"{xlabel} (No Data)")
+            continue
+
+        if global_bins is not None and col in global_bins:
+            bin_edges = global_bins[col]
+        else:
+            vmin, vmax = combined.min(), combined.max()
+            n_bins = min(bins, max(5, len(combined) // 2))
+            if is_log:
+                if vmin == vmax:
+                    vmin, vmax = vmin * 0.8, vmax * 1.2
+                bin_edges = np.logspace(np.log10(vmin), np.log10(vmax), n_bins + 1)
+            else:
+                if vmin == vmax:
+                    vmin, vmax = vmin - 0.5, vmax + 0.5
+                bin_edges = np.linspace(vmin, vmax, n_bins + 1)
+
+        if is_log:
+            ax.set_xscale('log')
+
+        for orient, vals in [('East', vals_east), ('West', vals_west)]:
+            if vals.empty:
+                continue
+            color = orient_colors[orient]
+            med = vals.median()
+            ax.hist(
+                vals, bins=bin_edges, alpha=0.5, color=color, edgecolor='black',
+                linewidth=0.8, label=f"{orient} (n={len(vals)}, med={med:.2f})"
+            )
+            ax.axvline(med, color=color, linestyle='--', linewidth=1.8)
+
+        ax.set_xlim(bin_edges[0], bin_edges[-1])
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel('Count')
+        ax.grid(True, linestyle='--', alpha=0.4)
+        ax.legend(fontsize=14)
+
+    for ax in axes[n_params:]:
+        ax.set_visible(False)
+
+    suffix_str = f" — {title_suffix}" if title_suffix else ""
+    fig.suptitle(f"{model_name} Fit Parameters{suffix_str} (East vs. West)", y=1.02)
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+
+# Precompute global bin edges once from the full catalog
+er_global_bins = compute_global_bins(df_fits, er_params, bins=20)
+band_global_bins = compute_global_bins(df_fits, band_params, bins=20)
+
+# Loop through each NOAA S-Scale present in df_fits
+s_scale_order = ['Below S1', 'S1', 'S2', 'S3', 'S4', 'S5']
+
+for s_scale in s_scale_order:
+    df_scale = df_fits[df_fits['S_Scale'] == s_scale]
+    if df_scale.empty:
+        continue
+
+    safe_name = s_scale.replace(' ', '_')
+    n_events = df_scale['Event'].nunique()
+    label_str = f"{s_scale} ({n_events} events)"
+
+    plot_param_histograms(
+        df_scale, er_params, 'Ellison-Ramaty',
+        hist_dir / f"ER_Parameters_Hist_{safe_name}_{mode_tag}.png",
+        title_suffix=label_str,
+        global_bins=er_global_bins
+    )
+    plot_param_histograms(
+        df_scale, band_params, 'Band',
+        hist_dir / f"Band_Parameters_Hist_{safe_name}_{mode_tag}.png",
+        title_suffix=label_str,
+        global_bins=band_global_bins
+    )
+
+print(f"Saved per-S-Scale parameter histograms to {hist_dir}")
+
+#%% East vs. West Statistical Comparison by NOAA S-Scale
+params_to_test = [
+    ('ER_log10_j0',   'Ellison-Ramaty', False),
+    ('ER_gamma',      'Ellison-Ramaty', False),
+    ('ER_E0',         'Ellison-Ramaty', True),
+    ('Band_log10_j0', 'Band',           False),
+    ('Band_gamma_a',  'Band',           False),
+    ('Band_gamma_b',  'Band',           False),
+    ('Band_E0',       'Band',           True),
+    ('Band_E_break',  'Band',           True),
+]
+
+s_scale_order = ['Below S1', 'S1', 'S2', 'S3', 'S4', 'S5']
+per_scale_rows = []
+
+for s_scale in s_scale_order:
+    df_scale = df_fits[df_fits['S_Scale'] == s_scale]
+    if df_scale.empty:
+        continue
+
+    for col, model, is_log in params_to_test:
+        # 1. Paired by (Event, Satellite) within this storm class
+        piv = df_scale.pivot_table(
+            index=['Event', 'Satellite'],
+            columns='Orientation',
+            values=col,
+            aggfunc='first'
+        )
+
+        if {'East', 'West'}.issubset(piv.columns):
+            paired = piv[['East', 'West']].dropna()
+            if is_log:
+                paired = paired[(paired['East'] > 0) & (paired['West'] > 0)]
+        else:
+            paired = pd.DataFrame(columns=['East', 'West'])
+
+        n_pairs = len(paired)
+        wilcoxon_p = np.nan
+        med_delta = np.nan
+
+        if n_pairs >= 5:
+            if is_log:
+                diff = np.log10(paired['West'] / paired['East'])
+                med_delta = (paired['West'] / paired['East']).median()
+            else:
+                diff = paired['West'] - paired['East']
+                med_delta = diff.median()
+
+            if not np.allclose(diff, 0):
+                _, wilcoxon_p = wilcoxon(diff, alternative='two-sided')
+
+        # 2. Unpaired Mann-Whitney U within this storm class
+        east_all = df_scale.loc[df_scale['Orientation'] == 'East', col].dropna()
+        west_all = df_scale.loc[df_scale['Orientation'] == 'West', col].dropna()
+        if is_log:
+            east_all = east_all[east_all > 0]
+            west_all = west_all[west_all > 0]
+
+        mwu_p = np.nan
+        if len(east_all) >= 3 and len(west_all) >= 3:
+            _, mwu_p = mannwhitneyu(east_all, west_all, alternative='two-sided')
+
+        per_scale_rows.append({
+            'S_Scale': s_scale,
+            'Model': model,
+            'Parameter': col,
+            'Scale': 'Ratio (W/E)' if is_log else 'Diff (W-E)',
+            'N_Pairs': n_pairs,
+            'East_Med': paired['East'].median() if n_pairs > 0 else np.nan,
+            'West_Med': paired['West'].median() if n_pairs > 0 else np.nan,
+            'Med_W_vs_E': med_delta,
+            'Wilcoxon_p': wilcoxon_p,
+            'Sig_05': (wilcoxon_p < 0.05) if pd.notna(wilcoxon_p) else False,
+            'MWU_p_Unpaired': mwu_p,
+        })
+
+df_ew_per_scale = pd.DataFrame(per_scale_rows)
+df_ew_per_scale.to_csv(BASE_DIR / f"East_West_Parameter_Stats_By_S_Scale_{mode_tag}.csv", index=False)
+
+for s_scale in s_scale_order:
+    df_out = df_ew_per_scale[df_ew_per_scale['S_Scale'] == s_scale]
+    if df_out.empty:
+        continue
+    n_events = df_fits.loc[df_fits['S_Scale'] == s_scale, 'Event'].nunique()
+    print(f"\n{'='*90}")
+    print(f"East vs. West Stats — {s_scale} ({n_events} unique events, mode={mode_tag})")
+    print(f"{'='*90}")
+    print(df_out.drop(columns=['S_Scale']).to_string(index=False, float_format=lambda x: f"{x:.4g}"))
+
+    #%% Kruskal-Wallis Test: Does East–West Anisotropy Scale with NOAA S-Scale (S1–S4)?
+from scipy.stats import kruskal
+
+params_to_test = [
+    ('ER_log10_j0',   'Ellison-Ramaty', False),
+    ('ER_gamma',      'Ellison-Ramaty', False),
+    ('ER_E0',         'Ellison-Ramaty', True),
+    ('Band_log10_j0', 'Band',           False),
+    ('Band_gamma_a',  'Band',           False),
+    ('Band_gamma_b',  'Band',           False),
+    ('Band_E0',       'Band',           True),
+    ('Band_E_break',  'Band',           True),
+]
+
+target_scales = ['S1', 'S2', 'S3', 'S4']
+df_s14 = df_fits[df_fits['S_Scale'].isin(target_scales)].copy()
+
+kw_rows = []
+
+for col, model, is_log in params_to_test:
+    # Pair simultaneous East & West fits per (Event, Satellite, S_Scale)
+    piv = df_s14.pivot_table(
+        index=['Event', 'Satellite', 'S_Scale'],
+        columns='Orientation',
+        values=col,
+        aggfunc='first'
+    ).reset_index()
+
+    if not {'East', 'West'}.issubset(piv.columns):
+        continue
+
+    paired = piv.dropna(subset=['East', 'West']).copy()
+    if is_log:
+        paired = paired[(paired['East'] > 0) & (paired['West'] > 0)]
+        # Rank-based Kruskal-Wallis gives identical H and p for W/E and log10(W/E)
+        paired['Delta'] = paired['West'] / paired['East']
+    else:
+        paired['Delta'] = paired['West'] - paired['East']
+
+    # Collect non-empty groups across S1–S4
+    groups = []
+    scale_meds = {}
+    scale_counts = {}
+
+    for sc in target_scales:
+        vals = paired.loc[paired['S_Scale'] == sc, 'Delta'].dropna().to_numpy(dtype=float)
+        scale_counts[sc] = len(vals)
+        scale_meds[sc] = np.median(vals) if len(vals) > 0 else np.nan
+        if len(vals) >= 2:  # Require at least 2 pairs per storm class to include in KW test
+            groups.append(vals)
+
+    kw_stat, kw_p = (np.nan, np.nan)
+    if len(groups) >= 2:
+        kw_stat, kw_p = kruskal(*groups)
+
+    row = {
+        'Model': model,
+        'Parameter': col,
+        'Metric': 'Ratio (W/E)' if is_log else 'Diff (W-E)',
+        'KW_H': kw_stat,
+        'KW_p': kw_p,
+        'Sig_05': (kw_p < 0.05) if pd.notna(kw_p) else False,
+    }
+    for sc in target_scales:
+        row[f'{sc}_Med(n)'] = f"{scale_meds[sc]:.3g} ({scale_counts[sc]})" if pd.notna(scale_meds[sc]) else f"NaN ({scale_counts[sc]})"
+
+    kw_rows.append(row)
+
+df_kw = pd.DataFrame(kw_rows)
+df_kw.to_csv(BASE_DIR / f"East_West_Anisotropy_KruskalWallis_S1_S4_{mode_tag}.csv", index=False)
+
+print(f"\n{'='*105}")
+print(f"Kruskal-Wallis Test Across S1–S4 on Paired East–West Offsets (mode={mode_tag})")
+print(f"{'='*105}")
+print(df_kw.to_string(index=False, float_format=lambda x: f"{x:.4g}"))
+
+#%% Spearman Correlation: Paired East–West Anisotropy vs. Continuous Max_PFU_10MeV
+params_to_test = [
+    ('ER_log10_j0',   'Ellison-Ramaty', False),
+    ('ER_gamma',      'Ellison-Ramaty', False),
+    ('ER_E0',         'Ellison-Ramaty', True),
+    ('Band_log10_j0', 'Band',           False),
+    ('Band_gamma_a',  'Band',           False),
+    ('Band_gamma_b',  'Band',           False),
+    ('Band_E0',       'Band',           True),
+    ('Band_E_break',  'Band',           True),
+]
+
+# Event-level PFU lookup from df_fits
+event_pfu_map = (
+    df_fits.dropna(subset=['Max_PFU_10MeV'])
+    .drop_duplicates(subset='Event')
+    .set_index('Event')['Max_PFU_10MeV']
+)
+
+spearman_rows = []
+m_tests = len(params_to_test)
+
+for col, model, is_log in params_to_test:
+    piv = df_fits.pivot_table(
+        index=['Event', 'Satellite'],
+        columns='Orientation',
+        values=col,
+        aggfunc='first'
+    ).reset_index()
+
+    if not {'East', 'West'}.issubset(piv.columns):
+        continue
+
+    piv['Max_PFU_10MeV'] = piv['Event'].map(event_pfu_map)
+    paired = piv.dropna(subset=['East', 'West', 'Max_PFU_10MeV']).copy()
+    paired = paired[paired['Max_PFU_10MeV'] > 0]
+
+    if is_log:
+        paired = paired[(paired['East'] > 0) & (paired['West'] > 0)]
+        paired['Delta'] = paired['West'] / paired['East']
+    else:
+        paired['Delta'] = paired['West'] - paired['East']
+
+    n_pairs = len(paired)
+    rho, p_val, p_adj = np.nan, np.nan, np.nan
+
+    if n_pairs >= 5:
+        res = spearmanr(paired['Max_PFU_10MeV'], paired['Delta'])
+        rho = res.statistic
+        p_val = res.pvalue
+        p_adj = min(p_val * m_tests, 1.0)
+
+    spearman_rows.append({
+        'Model': model,
+        'Parameter': col,
+        'Metric': 'Ratio (W/E)' if is_log else 'Diff (W-E)',
+        'N_Pairs': n_pairs,
+        'Spearman_rho': rho,
+        'p_value': p_val,
+        'p_bonf': p_adj,
+        'Sig_05': (p_val < 0.05) if pd.notna(p_val) else False,
+        'Sig_Bonf_05': (p_adj < 0.05) if pd.notna(p_adj) else False,
+    })
+
+df_ew_pfu_corr = pd.DataFrame(spearman_rows)
+df_ew_pfu_corr.to_csv(BASE_DIR / f"East_West_Anisotropy_vs_PFU_Spearman_{mode_tag}.csv", index=False)
+
+print(f"\n{'='*95}")
+print(f"Spearman Correlation: Paired East–West Offsets vs. Max_PFU_10MeV (mode={mode_tag})")
+print(f"{'='*95}")
+print(df_ew_pfu_corr.to_string(index=False, float_format=lambda x: f"{x:.4g}"))
+
+#%% Scatter Plot Grid: Paired East–West Parameter Offsets vs. Max_PFU_10MeV
+scatter_dir = BASE_DIR / "Stat_Plots"
+scatter_dir.mkdir(parents=True, exist_ok=True)
+
+params_to_plot = [
+    ('ER_log10_j0',   r'ER $\Delta \log_{10}(j_0)$ (W - E)',    False),
+    ('ER_gamma',      r'ER $\Delta \gamma$ (W - E)',            False),
+    ('ER_E0',         r'ER $E_0$ Ratio (W / E)',                True),
+    ('Band_log10_j0', r'Band $\Delta \log_{10}(j_0)$ (W - E)',  False),
+    ('Band_gamma_a',  r'Band $\Delta \gamma_a$ (W - E)',        False),
+    ('Band_gamma_b',  r'Band $\Delta \gamma_b$ (W - E)',        False),
+    ('Band_E0',       r'Band $E_0$ Ratio (W / E)',              True),
+    ('Band_E_break',  r'Band $E_{\mathrm{break}}$ Ratio (W / E)', True),
+]
+
+s_scale_order = ['Below S1', 'S1', 'S2', 'S3', 'S4', 'S5']
+s_scale_colors = {
+    'Below S1': '#7f7f7f',  # Gray
+    'S1':       '#f1c40f',  # Gold
+    'S2':       '#e67e22',  # Orange
+    'S3':       '#d35400',  # Burnt Orange
+    'S4':       '#c0392b',  # Red
+    'S5':       '#6c3483',  # Deep Purple
+    'Unknown':  '#bdc3c7',  # Light Gray
+}
+
+# Event-level metadata lookup
+event_meta_df = (
+    df_fits.dropna(subset=['Max_PFU_10MeV'])
+    .drop_duplicates(subset='Event')
+    .set_index('Event')[['Max_PFU_10MeV', 'S_Scale']]
+)
+
+fig, axes = plt.subplots(2, 4, figsize=(24, 11), sharex=True)
+axes = axes.ravel()
+m_tests = len(params_to_plot)
+present_scales = set()
+
+for ax, (col, ylabel, is_log) in zip(axes, params_to_plot):
+    piv = df_fits.pivot_table(
+        index=['Event', 'Satellite'],
+        columns='Orientation',
+        values=col,
+        aggfunc='first'
+    ).reset_index()
+
+    if not {'East', 'West'}.issubset(piv.columns):
+        ax.set_title(f"{col} (No Pairs)")
+        continue
+
+    piv['Max_PFU_10MeV'] = piv['Event'].map(event_meta_df['Max_PFU_10MeV'])
+    piv['S_Scale'] = piv['Event'].map(event_meta_df['S_Scale']).fillna('Unknown')
+
+    paired = piv.dropna(subset=['East', 'West', 'Max_PFU_10MeV']).copy()
+    paired = paired[paired['Max_PFU_10MeV'] > 0]
+
+    if is_log:
+        paired = paired[(paired['East'] > 0) & (paired['West'] > 0)]
+        paired['Delta'] = paired['West'] / paired['East']
+        ref_val = 1.0
+        ax.set_yscale('log')
+    else:
+        paired['Delta'] = paired['West'] - paired['East']
+        ref_val = 0.0
+
+    # Zero-offset / unity-ratio reference line
+    ax.axhline(ref_val, color='black', linestyle='--', linewidth=1.3, alpha=0.65, zorder=2)
+
+    # Plot by S-Scale in order so stronger storms draw cleanly on top
+    for sc in s_scale_order + ['Unknown']:
+        sub = paired[paired['S_Scale'] == sc]
+        if sub.empty:
+            continue
+        present_scales.add(sc)
+        ax.scatter(
+            sub['Max_PFU_10MeV'], sub['Delta'],
+            color=s_scale_colors.get(sc, '#7f7f7f'),
+            edgecolor='black', linewidth=0.7,
+            s=75, alpha=0.85, zorder=4
+        )
+
+    # Spearman correlation annotation
+    n_pairs = len(paired)
+    if n_pairs >= 5:
+        res = spearmanr(paired['Max_PFU_10MeV'], paired['Delta'])
+        rho, p_val = res.statistic, res.pvalue
+        p_adj = min(p_val * m_tests, 1.0)
+        stars = p_to_stars(p_adj)
+        stat_text = (
+            f"n = {n_pairs}\n"
+            f"$\\rho$ = {rho:+.2f} {stars}\n"
+            f"$p$ = {p_val:.3g}\n"
+            f"$p_{{\\mathrm{{adj}}}}$ = {p_adj:.3g}"
+        )
+    else:
+        stat_text = f"n = {n_pairs}\n(Insufficient)"
+
+    ax.text(
+        0.04, 0.96, stat_text,
+        transform=ax.transAxes,
+        ha='left', va='top',
+        fontsize=FONT_SIZE - 6, fontweight='bold',
+        bbox=dict(boxstyle='round,pad=0.35', facecolor='white', edgecolor='gray', alpha=0.88),
+        zorder=10
+    )
+
+    ax.set_xscale('log')
+    ax.set_ylabel(ylabel, fontsize=FONT_SIZE - 3, fontweight='bold')
+    ax.grid(True, which='major', linestyle='--', alpha=0.4)
+
+# Label x-axis on bottom row only
+for ax in axes[4:]:
+    ax.set_xlabel('>10 MeV Max Flux (pfu)', fontsize=FONT_SIZE - 2, fontweight='bold')
+
+# Shared legend across the top
+legend_handles = [
+    Line2D([0], [0], marker='o', color='w', markerfacecolor=s_scale_colors[sc],
+           markeredgecolor='black', markeredgewidth=0.8, markersize=11, label=sc)
+    for sc in s_scale_order if sc in present_scales
+]
+fig.legend(
+    handles=legend_handles, loc='upper center', bbox_to_anchor=(0.5, 0.965),
+    ncol=len(legend_handles), frameon=True, title="NOAA S-Scale",
+    fontsize=FONT_SIZE - 3, title_fontsize=FONT_SIZE - 2
+)
+
+fig.suptitle(
+    f"Paired East–West Parameter Offsets vs. Storm Intensity (mode={mode_tag})",
+    fontweight='bold', y=1.01
+)
+fig.text(
+    0.5, -0.01,
+    f"Stars reflect Bonferroni-adjusted significance (m={m_tests}): * p_adj < 0.05  |  ** p_adj < 0.01  |  *** p_adj < 0.001",
+    ha='center', fontsize=FONT_SIZE - 5, color='dimgray'
+)
+
+plt.tight_layout(rect=[0, 0.02, 1, 0.91])
+save_path = scatter_dir / f"East_West_Offsets_vs_PFU_Scatter_{mode_tag}.png"
+fig.savefig(save_path, dpi=300, bbox_inches='tight')
+plt.show()
+plt.close(fig)
+
+print(f"Saved scatter plot grid to {save_path}")
