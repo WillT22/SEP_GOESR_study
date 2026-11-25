@@ -875,7 +875,6 @@ plot_param_histograms(
 
 print(f"Saved parameter histograms to {hist_dir}")
 
-#%% Separate storm times
 #%% Plot ER and Band Fit Parameter Histograms by NOAA S-Scale (Shared Global X-Axis)
 hist_dir = BASE_DIR / "Stat_Plots" / "By_S_Scale"
 hist_dir.mkdir(parents=True, exist_ok=True)
@@ -1105,9 +1104,7 @@ for s_scale in s_scale_order:
     print(f"{'='*90}")
     print(df_out.drop(columns=['S_Scale']).to_string(index=False, float_format=lambda x: f"{x:.4g}"))
 
-    #%% Kruskal-Wallis Test: Does East–West Anisotropy Scale with NOAA S-Scale (S1–S4)?
-from scipy.stats import kruskal
-
+#%% Kruskal-Wallis Test: Does East–West Anisotropy Scale with NOAA S-Scale (S1–S4)?
 params_to_test = [
     ('ER_log10_j0',   'Ellison-Ramaty', False),
     ('ER_gamma',      'Ellison-Ramaty', False),
@@ -1181,7 +1178,8 @@ print(f"Kruskal-Wallis Test Across S1–S4 on Paired East–West Offsets (mode={
 print(f"{'='*105}")
 print(df_kw.to_string(index=False, float_format=lambda x: f"{x:.4g}"))
 
-#%% Spearman Correlation: Paired East–West Anisotropy vs. Continuous Max_PFU_10MeV
+
+#%% Do East and West Coefficients Individually Change with NOAA S-Scale (S1–S4)?
 params_to_test = [
     ('ER_log10_j0',   'Ellison-Ramaty', False),
     ('ER_gamma',      'Ellison-Ramaty', False),
@@ -1193,206 +1191,263 @@ params_to_test = [
     ('Band_E_break',  'Band',           True),
 ]
 
-# Event-level PFU lookup from df_fits
-event_pfu_map = (
-    df_fits.dropna(subset=['Max_PFU_10MeV'])
-    .drop_duplicates(subset='Event')
-    .set_index('Event')['Max_PFU_10MeV']
-)
-
-spearman_rows = []
+target_scales = ['S1', 'S2', 'S3', 'S4']
 m_tests = len(params_to_test)
+orient_scale_rows = []
 
-for col, model, is_log in params_to_test:
-    piv = df_fits.pivot_table(
-        index=['Event', 'Satellite'],
-        columns='Orientation',
-        values=col,
-        aggfunc='first'
-    ).reset_index()
+for orient in ['East', 'West']:
+    df_orient = df_fits[df_fits['Orientation'] == orient].copy()
+    df_orient_s14 = df_orient[df_orient['S_Scale'].isin(target_scales)]
 
-    if not {'East', 'West'}.issubset(piv.columns):
-        continue
+    for col, model, is_log in params_to_test:
+        # --- 1. Kruskal-Wallis across S1–S4 ---
+        groups = []
+        scale_meds = {}
+        scale_counts = {}
 
-    piv['Max_PFU_10MeV'] = piv['Event'].map(event_pfu_map)
-    paired = piv.dropna(subset=['East', 'West', 'Max_PFU_10MeV']).copy()
-    paired = paired[paired['Max_PFU_10MeV'] > 0]
+        for sc in target_scales:
+            vals = df_orient_s14.loc[df_orient_s14['S_Scale'] == sc, col].dropna()
+            if is_log:
+                vals = vals[vals > 0]
+            vals = vals.to_numpy(dtype=float)
 
-    if is_log:
-        paired = paired[(paired['East'] > 0) & (paired['West'] > 0)]
-        paired['Delta'] = paired['West'] / paired['East']
-    else:
-        paired['Delta'] = paired['West'] - paired['East']
+            scale_counts[sc] = len(vals)
+            scale_meds[sc] = np.median(vals) if len(vals) > 0 else np.nan
+            if len(vals) >= 2:
+                groups.append(vals)
 
-    n_pairs = len(paired)
-    rho, p_val, p_adj = np.nan, np.nan, np.nan
+        kw_stat, kw_p = (np.nan, np.nan)
+        if len(groups) >= 2:
+            kw_stat, kw_p = kruskal(*groups)
 
-    if n_pairs >= 5:
-        res = spearmanr(paired['Max_PFU_10MeV'], paired['Delta'])
-        rho = res.statistic
-        p_val = res.pvalue
-        p_adj = min(p_val * m_tests, 1.0)
+        # --- 2. Continuous Spearman vs. Max_PFU_10MeV (all events with valid PFU) ---
+        df_sp = df_orient.dropna(subset=[col, 'Max_PFU_10MeV'])
+        df_sp = df_sp[df_sp['Max_PFU_10MeV'] > 0]
+        if is_log:
+            df_sp = df_sp[df_sp[col] > 0]
 
-    spearman_rows.append({
-        'Model': model,
-        'Parameter': col,
-        'Metric': 'Ratio (W/E)' if is_log else 'Diff (W-E)',
-        'N_Pairs': n_pairs,
-        'Spearman_rho': rho,
-        'p_value': p_val,
-        'p_bonf': p_adj,
-        'Sig_05': (p_val < 0.05) if pd.notna(p_val) else False,
-        'Sig_Bonf_05': (p_adj < 0.05) if pd.notna(p_adj) else False,
-    })
+        rho, sp_p, sp_p_bonf = np.nan, np.nan, np.nan
+        if len(df_sp) >= 5:
+            res = spearmanr(df_sp['Max_PFU_10MeV'], df_sp[col])
+            rho = res.statistic
+            sp_p = res.pvalue
+            sp_p_bonf = min(sp_p * m_tests, 1.0)
 
-df_ew_pfu_corr = pd.DataFrame(spearman_rows)
-df_ew_pfu_corr.to_csv(BASE_DIR / f"East_West_Anisotropy_vs_PFU_Spearman_{mode_tag}.csv", index=False)
+        row = {
+            'Orientation': orient,
+            'Model': model,
+            'Parameter': col,
+            'KW_H': kw_stat,
+            'KW_p': kw_p,
+            'Spearman_rho': rho,
+            'Spearman_p': sp_p,
+            'Spearman_p_bonf': sp_p_bonf,
+            'Sig_Bonf_05': (sp_p_bonf < 0.05) if pd.notna(sp_p_bonf) else False,
+        }
+        for sc in target_scales:
+            row[f'{sc}_Med(n)'] = (
+                f"{scale_meds[sc]:.3g} ({scale_counts[sc]})"
+                if pd.notna(scale_meds[sc]) else f"NaN ({scale_counts[sc]})"
+            )
 
-print(f"\n{'='*95}")
-print(f"Spearman Correlation: Paired East–West Offsets vs. Max_PFU_10MeV (mode={mode_tag})")
-print(f"{'='*95}")
-print(df_ew_pfu_corr.to_string(index=False, float_format=lambda x: f"{x:.4g}"))
+        orient_scale_rows.append(row)
 
-#%% Scatter Plot Grid: Paired East–West Parameter Offsets vs. Max_PFU_10MeV
-scatter_dir = BASE_DIR / "Stat_Plots"
-scatter_dir.mkdir(parents=True, exist_ok=True)
+df_orient_scale = pd.DataFrame(orient_scale_rows)
+df_orient_scale.to_csv(BASE_DIR / f"East_West_Coefficients_vs_S_Scale_{mode_tag}.csv", index=False)
 
-params_to_plot = [
-    ('ER_log10_j0',   r'ER $\Delta \log_{10}(j_0)$ (W - E)',    False),
-    ('ER_gamma',      r'ER $\Delta \gamma$ (W - E)',            False),
-    ('ER_E0',         r'ER $E_0$ Ratio (W / E)',                True),
-    ('Band_log10_j0', r'Band $\Delta \log_{10}(j_0)$ (W - E)',  False),
-    ('Band_gamma_a',  r'Band $\Delta \gamma_a$ (W - E)',        False),
-    ('Band_gamma_b',  r'Band $\Delta \gamma_b$ (W - E)',        False),
-    ('Band_E0',       r'Band $E_0$ Ratio (W / E)',              True),
-    ('Band_E_break',  r'Band $E_{\mathrm{break}}$ Ratio (W / E)', True),
+for orient in ['East', 'West']:
+    df_out = df_orient_scale[df_orient_scale['Orientation'] == orient].drop(columns=['Orientation'])
+    print(f"\n{'='*115}")
+    print(f"{orient} Coefficients vs. Storm Scale (mode={mode_tag})")
+    print(f"{'='*115}")
+    print(df_out.to_string(index=False, float_format=lambda x: f"{x:.4g}"))
+
+
+#%% Side-by-Side Boxplots with Paired Wilcoxon Significance Annotations (S1–S4)
+from matplotlib.patches import Patch
+from scipy.stats import wilcoxon
+
+box_dir = BASE_DIR / "Stat_Plots"
+box_dir.mkdir(parents=True, exist_ok=True)
+
+orient_colors = {'East': '#1f77b4', 'West': '#ff7f0e'}
+target_scales = ['S1', 'S2', 'S3', 'S4']
+
+er_params = [
+    ('ER_log10_j0', r'$\log_{10}(j_0)$', False),
+    ('ER_gamma',    r'$\gamma$',         False),
+    ('ER_E0',       r'$E_0$ (MeV)',      True),
 ]
 
-s_scale_order = ['Below S1', 'S1', 'S2', 'S3', 'S4', 'S5']
-s_scale_colors = {
-    'Below S1': '#7f7f7f',  # Gray
-    'S1':       '#f1c40f',  # Gold
-    'S2':       '#e67e22',  # Orange
-    'S3':       '#d35400',  # Burnt Orange
-    'S4':       '#c0392b',  # Red
-    'S5':       '#6c3483',  # Deep Purple
-    'Unknown':  '#bdc3c7',  # Light Gray
-}
+band_params = [
+    ('Band_log10_j0', r'$\log_{10}(j_0)$',           False),
+    ('Band_gamma_a',  r'$\gamma_a$',                 False),
+    ('Band_gamma_b',  r'$\gamma_b$',                 False),
+    ('Band_E0',       r'$E_0$ (MeV)',                True),
+    ('Band_E_break',  r'$E_{\mathrm{break}}$ (MeV)', True),
+]
 
-# Event-level metadata lookup
-event_meta_df = (
-    df_fits.dropna(subset=['Max_PFU_10MeV'])
-    .drop_duplicates(subset='Event')
-    .set_index('Event')[['Max_PFU_10MeV', 'S_Scale']]
-)
 
-fig, axes = plt.subplots(2, 4, figsize=(24, 11), sharex=True)
-axes = axes.ravel()
-m_tests = len(params_to_plot)
-present_scales = set()
+def plot_s_scale_boxplots(df_sub, params, model_name, save_path):
+    n_params = len(params)
+    ncols = 3
+    nrows = int(np.ceil(n_params / ncols))
 
-for ax, (col, ylabel, is_log) in zip(axes, params_to_plot):
-    piv = df_fits.pivot_table(
-        index=['Event', 'Satellite'],
-        columns='Orientation',
-        values=col,
-        aggfunc='first'
-    ).reset_index()
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 5.5 * nrows))
+    axes = np.atleast_1d(axes).ravel()
 
-    if not {'East', 'West'}.issubset(piv.columns):
-        ax.set_title(f"{col} (No Pairs)")
-        continue
+    df_s14 = df_sub[df_sub['S_Scale'].isin(target_scales)].copy()
+    rng = np.random.default_rng(42)
 
-    piv['Max_PFU_10MeV'] = piv['Event'].map(event_meta_df['Max_PFU_10MeV'])
-    piv['S_Scale'] = piv['Event'].map(event_meta_df['S_Scale']).fillna('Unknown')
+    offsets = {'East': -0.18, 'West': 0.18}
+    box_width = 0.32
 
-    paired = piv.dropna(subset=['East', 'West', 'Max_PFU_10MeV']).copy()
-    paired = paired[paired['Max_PFU_10MeV'] > 0]
+    xtick_labels = [
+        f"{sc}\n(n={df_s14.loc[df_s14['S_Scale'] == sc, 'Event'].nunique()})"
+        for sc in target_scales
+    ]
 
-    if is_log:
-        paired = paired[(paired['East'] > 0) & (paired['West'] > 0)]
-        paired['Delta'] = paired['West'] / paired['East']
-        ref_val = 1.0
-        ax.set_yscale('log')
-    else:
-        paired['Delta'] = paired['West'] - paired['East']
-        ref_val = 0.0
+    for ax, (col, ylabel, is_log) in zip(axes, params):
+        tested_pairs = []  # Store (x_idx, pair_top, raw_p) for Bonferroni adjustment
 
-    # Zero-offset / unity-ratio reference line
-    ax.axhline(ref_val, color='black', linestyle='--', linewidth=1.3, alpha=0.65, zorder=2)
+        for i, sc in enumerate(target_scales):
+            df_sc = df_s14[df_s14['S_Scale'] == sc]
+            pair_max_vals = []
 
-    # Plot by S-Scale in order so stronger storms draw cleanly on top
-    for sc in s_scale_order + ['Unknown']:
-        sub = paired[paired['S_Scale'] == sc]
-        if sub.empty:
-            continue
-        present_scales.add(sc)
-        ax.scatter(
-            sub['Max_PFU_10MeV'], sub['Delta'],
-            color=s_scale_colors.get(sc, '#7f7f7f'),
-            edgecolor='black', linewidth=0.7,
-            s=75, alpha=0.85, zorder=4
-        )
+            for orient in ['East', 'West']:
+                vals = df_sc.loc[df_sc['Orientation'] == orient, col].dropna()
+                if is_log:
+                    vals = vals[vals > 0]
+                vals = vals.to_numpy(dtype=float)
 
-    # Spearman correlation annotation
-    n_pairs = len(paired)
-    if n_pairs >= 5:
-        res = spearmanr(paired['Max_PFU_10MeV'], paired['Delta'])
-        rho, p_val = res.statistic, res.pvalue
-        p_adj = min(p_val * m_tests, 1.0)
-        stars = p_to_stars(p_adj)
-        stat_text = (
-            f"n = {n_pairs}\n"
-            f"$\\rho$ = {rho:+.2f} {stars}\n"
-            f"$p$ = {p_val:.3g}\n"
-            f"$p_{{\\mathrm{{adj}}}}$ = {p_adj:.3g}"
-        )
-    else:
-        stat_text = f"n = {n_pairs}\n(Insufficient)"
+                if len(vals) == 0:
+                    continue
 
-    ax.text(
-        0.04, 0.96, stat_text,
-        transform=ax.transAxes,
-        ha='left', va='top',
-        fontsize=FONT_SIZE - 6, fontweight='bold',
-        bbox=dict(boxstyle='round,pad=0.35', facecolor='white', edgecolor='gray', alpha=0.88),
-        zorder=10
+                pair_max_vals.append(np.max(vals))
+                pos = i + offsets[orient]
+                color = orient_colors[orient]
+
+                ax.boxplot(
+                    [vals],
+                    positions=[pos],
+                    widths=box_width,
+                    patch_artist=True,
+                    showfliers=False,
+                    boxprops=dict(facecolor=color, edgecolor='black', alpha=0.55, linewidth=1.2),
+                    medianprops=dict(color='black', linewidth=2.0),
+                    whiskerprops=dict(color='black', linewidth=1.2),
+                    capprops=dict(color='black', linewidth=1.2),
+                    zorder=3
+                )
+
+                jitter = rng.uniform(-0.07, 0.07, size=len(vals))
+                ax.scatter(
+                    np.full(len(vals), pos) + jitter,
+                    vals,
+                    color=color, edgecolor='black', linewidth=0.6,
+                    s=35, alpha=0.8, zorder=4
+                )
+
+            # Paired Wilcoxon test for this S-Scale
+            piv = df_sc.pivot_table(
+                index=['Event', 'Satellite'],
+                columns='Orientation',
+                values=col,
+                aggfunc='first'
+            )
+            if {'East', 'West'}.issubset(piv.columns) and pair_max_vals:
+                paired = piv[['East', 'West']].dropna()
+                if is_log:
+                    paired = paired[(paired['East'] > 0) & (paired['West'] > 0)]
+                    diff = np.log10(paired['West'] / paired['East'])
+                else:
+                    diff = paired['West'] - paired['East']
+
+                if len(paired) >= 5 and not np.allclose(diff, 0):
+                    _, p_val = wilcoxon(diff, alternative='two-sided')
+                    tested_pairs.append((i, max(pair_max_vals), p_val))
+
+        # Apply Bonferroni correction across tested S-Scale groups within this panel
+        m_tests = len(tested_pairs)
+        sig_annotations = []
+        for x_idx, pair_top, raw_p in tested_pairs:
+            p_adj = min(raw_p * m_tests, 1.0)
+            stars = p_to_stars(p_adj)
+            if stars:
+                sig_annotations.append((x_idx, pair_top, stars))
+
+        if is_log:
+            ax.set_yscale('log')
+
+        # Draw brackets and stars after autoscale determines the axis range
+        ymin, ymax = ax.get_ylim()
+        if sig_annotations:
+            max_annot_top = ymax
+            for x_idx, pair_top, stars in sig_annotations:
+                x1 = x_idx + offsets['East']
+                x2 = x_idx + offsets['West']
+
+                if is_log:
+                    log_span = np.log10(ymax) - np.log10(ymin)
+                    y_base = pair_top * (10 ** (0.04 * log_span))
+                    y_tip = y_base * (10 ** (0.03 * log_span))
+                    y_txt = y_tip * (10 ** (0.01 * log_span))
+                    max_annot_top = max(max_annot_top, y_txt * (10 ** (0.08 * log_span)))
+                else:
+                    y_span = ymax - ymin
+                    y_base = pair_top + 0.04 * y_span
+                    y_tip = y_base + 0.03 * y_span
+                    y_txt = y_tip + 0.01 * y_span
+                    max_annot_top = max(max_annot_top, y_txt + 0.08 * y_span)
+
+                ax.plot([x1, x1, x2, x2], [y_base, y_tip, y_tip, y_base],
+                        color='black', linewidth=1.3, zorder=5)
+                ax.text(x_idx, y_txt, stars, ha='center', va='bottom',
+                        fontsize=FONT_SIZE - 3, fontweight='bold', color='black', zorder=6)
+
+            ax.set_ylim(ymin, max_annot_top)
+
+        ax.set_xticks(range(len(target_scales)))
+        ax.set_xticklabels(xtick_labels, fontsize=FONT_SIZE - 3)
+        ax.set_xlim(-0.55, len(target_scales) - 0.45)
+        ax.set_ylabel(ylabel, fontweight='bold')
+        ax.grid(True, axis='y', linestyle='--', alpha=0.4)
+
+    for ax in axes[n_params:]:
+        ax.set_visible(False)
+
+    legend_handles = [
+        Patch(facecolor=orient_colors['East'], edgecolor='black', alpha=0.6, label='East'),
+        Patch(facecolor=orient_colors['West'], edgecolor='black', alpha=0.6, label='West'),
+    ]
+    fig.legend(
+        handles=legend_handles, loc='upper center', bbox_to_anchor=(0.5, 0.96),
+        ncol=2, frameon=True, fontsize=FONT_SIZE - 2
     )
 
-    ax.set_xscale('log')
-    ax.set_ylabel(ylabel, fontsize=FONT_SIZE - 3, fontweight='bold')
-    ax.grid(True, which='major', linestyle='--', alpha=0.4)
+    fig.suptitle(
+        f"{model_name} Fit Coefficients Across NOAA S-Scales (mode={mode_tag})",
+        fontweight='bold', y=1.02
+    )
+    fig.text(
+        0.5, -0.01,
+        "* $p_{\\mathrm{adj}}$ < 0.05   |   ** $p_{\\mathrm{adj}}$ < 0.01   |   *** $p_{\\mathrm{adj}}$ < 0.001  (Paired Wilcoxon, Bonferroni-corrected per panel, n >= 5)",
+        ha='center', fontsize=FONT_SIZE - 5, color='dimgray'
+    )
 
-# Label x-axis on bottom row only
-for ax in axes[4:]:
-    ax.set_xlabel('>10 MeV Max Flux (pfu)', fontsize=FONT_SIZE - 2, fontweight='bold')
+    plt.tight_layout(rect=[0, 0.02, 1, 0.91])
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    plt.close(fig)
 
-# Shared legend across the top
-legend_handles = [
-    Line2D([0], [0], marker='o', color='w', markerfacecolor=s_scale_colors[sc],
-           markeredgecolor='black', markeredgewidth=0.8, markersize=11, label=sc)
-    for sc in s_scale_order if sc in present_scales
-]
-fig.legend(
-    handles=legend_handles, loc='upper center', bbox_to_anchor=(0.5, 0.965),
-    ncol=len(legend_handles), frameon=True, title="NOAA S-Scale",
-    fontsize=FONT_SIZE - 3, title_fontsize=FONT_SIZE - 2
+
+plot_s_scale_boxplots(
+    df_fits, er_params, 'Ellison-Ramaty',
+    box_dir / f"ER_Coefficients_By_S_Scale_Boxplot_{mode_tag}.png"
+)
+plot_s_scale_boxplots(
+    df_fits, band_params, 'Band',
+    box_dir / f"Band_Coefficients_By_S_Scale_Boxplot_{mode_tag}.png"
 )
 
-fig.suptitle(
-    f"Paired East–West Parameter Offsets vs. Storm Intensity (mode={mode_tag})",
-    fontweight='bold', y=1.01
-)
-fig.text(
-    0.5, -0.01,
-    f"Stars reflect Bonferroni-adjusted significance (m={m_tests}): * p_adj < 0.05  |  ** p_adj < 0.01  |  *** p_adj < 0.001",
-    ha='center', fontsize=FONT_SIZE - 5, color='dimgray'
-)
-
-plt.tight_layout(rect=[0, 0.02, 1, 0.91])
-save_path = scatter_dir / f"East_West_Offsets_vs_PFU_Scatter_{mode_tag}.png"
-fig.savefig(save_path, dpi=300, bbox_inches='tight')
-plt.show()
-plt.close(fig)
-
-print(f"Saved scatter plot grid to {save_path}")
+print(f"Saved annotated S-Scale boxplots to {box_dir}")
